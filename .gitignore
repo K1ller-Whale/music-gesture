@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Data & artifacts
+data/
+datasets/raw/
+datasets/processed/
+runs/
+checkpoints/
+*.pth
+*.ckpt
+*.wav
+*.mp4
+*.npy
+*.npz
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
