@@ -431,9 +431,9 @@ def main():
     # cfg/ckpt paths are resolved relative to --alphapose_root.
     ap.add_argument("--alphapose_root", default="/kaggle/working/AlphaPose")
     ap.add_argument("--ap_cfg",
-                    default="configs/halpe_136/resnet/256x192_res50_lr1e-3_2x.yaml")
+                    default="configs/halpe_136/resnet/256x192_res50_lr1e-3_2x-regression.yaml")
     ap.add_argument("--ap_ckpt",
-                    default="pretrained_models/halpe136_fast_res50_256x192.pth")
+                    default="pretrained_models/halpe136_fast50_regression_256x192.pth")
     ap.add_argument("--ap_detector", default="yolo")
     ap.add_argument("--ap_gpus", default="0")
     args = ap.parse_args()
