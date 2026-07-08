@@ -13,7 +13,8 @@ repo's Mix-and-Separate loader treats every URMP stem-segment as a solo.
 
 Pose modes:
     --pose zeros       zeros pose + full-frame context (fast smoke test of the loop)
-    --pose mediapipe   real per-player body+hand keypoints via MediaPipe Tasks
+    --pose mediapipe   per-player body+hand keypoints via MediaPipe Tasks (CPU)
+    --pose alphapose   paper-faithful RMPE/AlphaPose Halpe-136 wholebody on GPU
 
 player<->stem assignment = left->right detected people matched to AuSep index
 order. Inspect debug/<piece>.jpg to confirm audio and crop line up per player.
@@ -103,6 +104,125 @@ def person_bbox(lms, w, h, pad=0.15):
     pw, ph = (x1 - x0) * pad, (y1 - y0) * pad
     return (max(0, int(x0 - pw)), max(0, int(y0 - ph)),
             min(w, int(x1 + pw)), min(h, int(y1 + ph)))
+
+
+# ---------- alphapose (RMPE) helpers : paper-faithful GPU wholebody ----------
+# Halpe-136 index -> COCO-18 (OpenPose ordering). Halpe has an explicit neck (18).
+HALPE2COCO = {0: 0, 18: 1, 6: 2, 8: 3, 10: 4, 5: 5, 7: 6, 9: 7, 12: 8,
+              14: 9, 16: 10, 11: 11, 13: 12, 15: 13, 2: 14, 1: 15, 4: 16, 3: 17}
+HALPE_RHAND0, HALPE_LHAND0 = 115, 94  # 21 keypoints each in Halpe-136
+
+
+def run_alphapose(frames_dir, args):
+    """Run AlphaPose demo_inference.py on a folder of frames; return results-json path."""
+    outdir = os.path.join(args.tmp, "_ap", os.path.basename(frames_dir.rstrip("/")))
+    os.makedirs(outdir, exist_ok=True)
+    demo = os.path.join(args.alphapose_root, "scripts", "demo_inference.py")
+    cmd = ["python", demo, "--cfg", args.ap_cfg, "--checkpoint", args.ap_ckpt,
+           "--indir", frames_dir, "--outdir", outdir, "--sp",
+           "--detector", args.ap_detector, "--gpus", args.ap_gpus]
+    subprocess.run(cmd, check=True, cwd=args.alphapose_root)
+    return os.path.join(outdir, "alphapose-results.json")
+
+
+def pts_bbox(xs, ys, w, h, pad=0.15):
+    x0, x1 = float(np.min(xs)), float(np.max(xs))
+    y0, y1 = float(np.min(ys)), float(np.max(ys))
+    pw, ph = (x1 - x0) * pad, (y1 - y0) * pad
+    return (max(0, int(x0 - pw)), max(0, int(y0 - ph)),
+            min(w, int(x1 + pw)), min(h, int(y1 + ph)))
+
+
+def _halpe_to_J(kp, x0, y0, bw_, bh_, size):
+    """kp: [136,3] absolute px -> J [60,3] crop-relative px in [0,size]."""
+    J = np.zeros((VJ, 3), np.float32)
+    for hp, ci in HALPE2COCO.items():
+        J[ci, 0] = (kp[hp, 0] - x0) / bw_ * size
+        J[ci, 1] = (kp[hp, 1] - y0) / bh_ * size
+        J[ci, 2] = kp[hp, 2]
+    for j in range(HAND):  # right hand -> block [BODY : BODY+HAND]
+        J[BODY + j, 0] = (kp[HALPE_RHAND0 + j, 0] - x0) / bw_ * size
+        J[BODY + j, 1] = (kp[HALPE_RHAND0 + j, 1] - y0) / bh_ * size
+        J[BODY + j, 2] = kp[HALPE_RHAND0 + j, 2]
+    for j in range(HAND):  # left hand -> block [BODY+HAND : BODY+2*HAND]
+        J[BODY + HAND + j, 0] = (kp[HALPE_LHAND0 + j, 0] - x0) / bw_ * size
+        J[BODY + HAND + j, 1] = (kp[HALPE_LHAND0 + j, 1] - y0) / bh_ * size
+        J[BODY + HAND + j, 2] = kp[HALPE_LHAND0 + j, 2]
+    return J
+
+
+def extract_piece_alphapose(pdir, args):
+    """Paper-faithful backend: AlphaPose (RMPE) Halpe-136 wholebody keypoints on GPU.
+    Runs every frame (no stride); mirrors the mediapipe path's outputs so
+    segment_and_write() is unchanged."""
+    import json
+    from collections import defaultdict
+    name = piece_name(pdir)
+    stems = parse_stems(pdir)
+    vids = glob.glob(os.path.join(pdir, "Vid_*.mp4"))
+    if not vids or not stems:
+        return name, [], []
+    frames_dir = os.path.join(args.tmp, name)
+    os.makedirs(frames_dir, exist_ok=True)
+    if not glob.glob(os.path.join(frames_dir, "*.jpg")):
+        sh(["ffmpeg", "-y", "-i", vids[0], "-vf", f"fps={args.fps},scale=-2:480",
+            os.path.join(frames_dir, "%06d.jpg")])
+    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    T = len(frame_paths)
+    n_players = len(stems)
+    size = args.frame_size
+    if T == 0:
+        return name, [], []
+
+    results = run_alphapose(frames_dir, args)
+    data = json.load(open(results))
+    idx_of = {os.path.basename(fp): t for t, fp in enumerate(frame_paths)}
+    by_frame = defaultdict(list)
+    for e in data:
+        t = idx_of.get(os.path.basename(str(e.get("image_id", ""))))
+        if t is not None:
+            by_frame[t].append(e)
+
+    poses = [np.zeros((T, VJ, 3), np.float32) for _ in range(n_players)]
+    crops = [[None] * T for _ in range(n_players)]
+    overlay = None
+
+    for t in range(T):
+        people = by_frame.get(t, [])
+        kps = [np.asarray(e["keypoints"], np.float32).reshape(-1, 3) for e in people]
+        # order people left->right by mean body x (same convention as mediapipe path)
+        order = sorted(range(len(kps)), key=lambda i: float(np.mean(kps[i][:26, 0])))
+        bgr = cv2.imread(frame_paths[t])
+        if bgr is None:
+            continue
+        h, w = bgr.shape[:2]
+        if t == 0:
+            overlay = bgr.copy()
+        for slot, pi in enumerate(order[:n_players]):
+            kp = kps[pi]
+            x0, y0, x1, y1 = pts_bbox(kp[:26, 0], kp[:26, 1], w, h)
+            bw_, bh_ = max(1, x1 - x0), max(1, y1 - y0)
+            poses[slot][t] = _halpe_to_J(kp, x0, y0, bw_, bh_, size)
+            crop = bgr[y0:y1, x0:x1]
+            if crop.size:
+                crop_rs = cv2.resize(crop, (size, size))
+                cpath = os.path.join(frames_dir, f"crop_s{slot}_{t:06d}.jpg")
+                cv2.imwrite(cpath, crop_rs)
+                crops[slot][t] = cpath
+            if t == 0 and overlay is not None:
+                cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                inst = stems[slot][1] if slot < len(stems) else "?"
+                cv2.putText(overlay, f"slot{slot}:{inst}", (x0, max(20, y0 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    if overlay is not None:
+        os.makedirs(os.path.join(args.out, "debug"), exist_ok=True)
+        cv2.imwrite(os.path.join(args.out, "debug", f"{name}.jpg"), overlay)
+
+    players = []
+    for slot, (k, instr, s) in enumerate(stems):
+        players.append(dict(k=k, instr=instr, stem=s, pose=poses[slot], crops=crops[slot]))
+    return name, players, frame_paths
 
 
 # ---------- core ----------
@@ -278,7 +398,7 @@ def main():
     ap.add_argument("--urmp_root", default="/kaggle/input")
     ap.add_argument("--out", default="datasets/processed")
     ap.add_argument("--tmp", default="/kaggle/working/_urmp_tmp")
-    ap.add_argument("--pose", choices=["zeros", "mediapipe"], default="mediapipe")
+    ap.add_argument("--pose", choices=["zeros", "mediapipe", "alphapose"], default="mediapipe")
     ap.add_argument("--sr", type=int, default=11025)
     ap.add_argument("--clip_seconds", type=float, default=6.0)
     ap.add_argument("--fps", type=int, default=8)
@@ -289,6 +409,15 @@ def main():
     ap.add_argument("--pose_stride", type=int, default=1,
                     help="run MediaPipe every Nth frame and interpolate the rest")
     ap.add_argument("--max_pieces", type=int, default=0, help="0 = all")
+    # AlphaPose (RMPE) backend -- paper-faithful GPU wholebody keypoints.
+    # cfg/ckpt paths are resolved relative to --alphapose_root.
+    ap.add_argument("--alphapose_root", default="/kaggle/working/AlphaPose")
+    ap.add_argument("--ap_cfg",
+                    default="configs/halpe_136/resnet/256x192_res50_lr1e-3_2x-regression.yaml")
+    ap.add_argument("--ap_ckpt",
+                    default="pretrained_models/halpe136_fast_res50_256x192.pth")
+    ap.add_argument("--ap_detector", default="yolo")
+    ap.add_argument("--ap_gpus", default="0")
     args = ap.parse_args()
 
     if sf is None or cv2 is None:
@@ -301,7 +430,12 @@ def main():
         pieces = pieces[:args.max_pieces]
     if not pieces:
         raise SystemExit(f"No AuSep_*.wav found under {args.urmp_root}")
-    tag = f" | stride: {args.pose_stride}" if args.pose == "mediapipe" else ""
+    if args.pose == "mediapipe":
+        tag = f" | stride: {args.pose_stride}"
+    elif args.pose == "alphapose":
+        tag = f" | detector: {args.ap_detector} | gpus: {args.ap_gpus}"
+    else:
+        tag = ""
     print(f"pieces: {len(pieces)} | pose mode: {args.pose}{tag}")
 
     detectors = None
@@ -313,7 +447,10 @@ def main():
         writer = csv.DictWriter(f, fieldnames=["clip", "category"])
         writer.writeheader()
         for i, pdir in enumerate(pieces):
-            name, players, frames = extract_piece(pdir, args, detectors)
+            if args.pose == "alphapose":
+                name, players, frames = extract_piece_alphapose(pdir, args)
+            else:
+                name, players, frames = extract_piece(pdir, args, detectors)
             if not players:
                 print(f"[{i+1}/{len(pieces)}] {name}: skipped (no video/stems)")
                 continue
