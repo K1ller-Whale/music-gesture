@@ -118,14 +118,28 @@ def run_alphapose(frames_dir, args):
     outdir = os.path.join(args.tmp, "_ap", os.path.basename(frames_dir.rstrip("/")))
     os.makedirs(outdir, exist_ok=True)
     demo = os.path.join(args.alphapose_root, "scripts", "demo_inference.py")
-    cmd = ["python", demo, "--cfg", args.ap_cfg, "--checkpoint", args.ap_ckpt,
-           "--indir", frames_dir, "--outdir", outdir, "--sp",
-           "--detector", args.ap_detector, "--gpus", args.ap_gpus]
-    # Make the alphapose package importable even without a pip install
-    # (a plain `setup.py build_ext --inplace` is enough).
+    argv = ["--cfg", args.ap_cfg, "--checkpoint", args.ap_ckpt,
+            "--indir", frames_dir, "--outdir", outdir, "--sp",
+            "--detector", args.ap_detector, "--gpus", args.ap_gpus]
+    # demo_inference.py imports the tracker stack (cython_bbox) at the top, which
+    # references numpy aliases removed in numpy>=1.24 (np.float/np.int/...).
+    # Shim those aliases first, then launch the script via runpy -- this avoids
+    # editing any AlphaPose source or downgrading numpy (torch is built on 2.x).
+    # PYTHONPATH lets the in-place build (`setup.py build_ext --inplace`) import
+    # without a pip install.
+    boot = (
+        "import numpy as _np\n"
+        "for _n,_t in (('float',float),('int',int),('bool',bool),('object',object),"
+        "('str',str),('complex',complex),('long',int),('unicode',str)):\n"
+        "    hasattr(_np,_n) or setattr(_np,_n,_t)\n"
+        "import runpy,sys\n"
+        "sys.argv=[{d!r}]+{a!r}\n"
+        "runpy.run_path({d!r},run_name='__main__')\n"
+    ).format(d=demo, a=argv)
     env = os.environ.copy()
     env["PYTHONPATH"] = args.alphapose_root + os.pathsep + env.get("PYTHONPATH", "")
-    subprocess.run(cmd, check=True, cwd=args.alphapose_root, env=env)
+    subprocess.run(["python", "-c", boot], check=True,
+                   cwd=args.alphapose_root, env=env)
     return os.path.join(outdir, "alphapose-results.json")
 
 
