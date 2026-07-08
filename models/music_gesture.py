@@ -1,29 +1,29 @@
 """Full Music Gesture model.
-​
+
 Given a mixture spectrogram and, for each source, that source's keypoints and a
 context crop, predict one separation mask per source.
 """
 from __future__ import annotations
-​
+
 from typing import List
-​
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-​
+
 from .audio_net import AudioUNet
 from .context_net import ContextNet
 from .pose_net import ContextAwareGraphCNN
 from .fusion import AudioVisualFusion
 from .synthesizer import MaskHead
-​
-​
+
+
 class MusicGesture(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         m = cfg["model"]
         dim = m["fusion"]["dim"]
-​
+
         self.audio_net = AudioUNet(
             ngf=m["audio"]["ngf"], num_downs=m["audio"]["num_downs"],
             input_nc=m["audio"]["input_nc"], output_nc=m["audio"]["output_nc"],
@@ -44,11 +44,11 @@ class MusicGesture(nn.Module):
             mlp_ratio=m["fusion"]["mlp_ratio"], dropout=m["fusion"]["dropout"],
         )
         self.mask_head = MaskHead(mask_type=cfg["audio"]["mask_type"])
-​
+
     def separate_one(self, spec: torch.Tensor, keypoints: torch.Tensor,
                      context_frame: torch.Tensor) -> torch.Tensor:
         """Predict a single source mask.
-​
+
         spec:          [B, 1, F, T]
         keypoints:     [B, C, Tk, V]
         context_frame: [B, 3, H, W]
@@ -68,7 +68,7 @@ class MusicGesture(nn.Module):
         logits = self.audio_net.decode(fused, hw, skips)
         logits = logits[..., :Fdim, :Tdim]  # crop back to the true spectrogram size
         return self.mask_head(logits)
-​
+
     def forward(self, mixture_spec: torch.Tensor,
                 keypoints: List[torch.Tensor],
                 context_frames: List[torch.Tensor]) -> List[torch.Tensor]:
