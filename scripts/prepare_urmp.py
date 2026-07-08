@@ -135,8 +135,14 @@ def extract_piece(pdir, args, detectors=None):
     size = args.frame_size
     overlay = None
 
-    for t, fp in enumerate(frame_paths):
-        bgr = cv2.imread(fp)
+    # Only run MediaPipe on every Nth (key) frame; interpolate the rest below.
+    stride = max(1, args.pose_stride)
+    key_ts = list(range(0, T, stride))
+    if T and key_ts[-1] != T - 1:
+        key_ts.append(T - 1)  # anchor the end so interpolation never extrapolates
+
+    for t in key_ts:
+        bgr = cv2.imread(frame_paths[t])
         if bgr is None:
             continue
         h, w = bgr.shape[:2]
@@ -187,6 +193,31 @@ def extract_piece(pdir, args, detectors=None):
                 inst = stems[slot][1] if slot < len(stems) else "?"
                 cv2.putText(overlay, f"slot{slot}:{inst}", (x0, max(20, y0 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    # Fill the frames we skipped: linearly interpolate keypoints between key
+    # frames and reuse the nearest key-frame crop for the context image.
+    if stride > 1 and T > 1 and key_ts:
+        key_arr = np.asarray(key_ts)
+        all_t = np.arange(T)
+        for slot in range(n_players):
+            flat = poses[slot][key_arr].reshape(len(key_arr), -1)
+            filled = np.empty((T, flat.shape[1]), np.float32)
+            for c in range(flat.shape[1]):
+                filled[:, c] = np.interp(all_t, key_arr, flat[:, c])
+            poses[slot] = filled.reshape(T, VJ, 3).astype(np.float32)
+            cl = crops[slot]
+            last = None
+            for t in range(T):
+                if cl[t] is not None:
+                    last = cl[t]
+                elif last is not None:
+                    cl[t] = last
+            nxt = None
+            for t in range(T - 1, -1, -1):
+                if cl[t] is not None:
+                    nxt = cl[t]
+                elif nxt is not None:
+                    cl[t] = nxt
 
     if overlay is not None:
         os.makedirs(os.path.join(args.out, "debug"), exist_ok=True)
@@ -255,6 +286,8 @@ def main():
     ap.add_argument("--frame_size", type=int, default=224)
     ap.add_argument("--seg_hop", type=float, default=6.0)
     ap.add_argument("--max_people", type=int, default=5)
+    ap.add_argument("--pose_stride", type=int, default=1,
+                    help="run MediaPipe every Nth frame and interpolate the rest")
     ap.add_argument("--max_pieces", type=int, default=0, help="0 = all")
     args = ap.parse_args()
 
@@ -268,7 +301,8 @@ def main():
         pieces = pieces[:args.max_pieces]
     if not pieces:
         raise SystemExit(f"No AuSep_*.wav found under {args.urmp_root}")
-    print(f"pieces: {len(pieces)} | pose mode: {args.pose}")
+    tag = f" | stride: {args.pose_stride}" if args.pose == "mediapipe" else ""
+    print(f"pieces: {len(pieces)} | pose mode: {args.pose}{tag}")
 
     detectors = None
     if args.pose == "mediapipe":
