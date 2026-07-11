@@ -9,6 +9,7 @@ import shutil
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
@@ -46,17 +47,42 @@ def build_targets(batch, mask_type: str):
     return targets
 
 
+def energy_weighted_bce(masks, targets, energy, floor):
+    """Per-pixel BCE restricted to time-frequency bins that carry energy.
+
+    ``energy`` is the (log-freq) mixture magnitude [B, 1, F, T]. Bins below
+    ``floor`` times each sample's peak magnitude are near-silent: their ideal
+    binary label is essentially a coin flip and, because they dominate the bin
+    count, they let the model minimise BCE by predicting a constant ~0.5. Zeroing
+    their weight makes the gradient come from the informative, energetic bins.
+    """
+    b = energy.shape[0]
+    peak = energy.reshape(b, -1).amax(dim=1).clamp_min(1e-8).reshape(b, 1, 1, 1)
+    weight = (energy >= floor * peak).float()
+    denom = weight.sum().clamp_min(1.0)
+    total = 0.0
+    for m, t in zip(masks, targets):
+        bce = F.binary_cross_entropy(m, t, reduction="none")
+        total = total + (bce * weight).sum() / denom
+    return total / len(masks)
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch):
     model.train()
     running = 0.0
     for step, batch in enumerate(loader):
-        mix = batch["mixture_mag"].to(device)
+        net_input = batch["net_input"].to(device)
+        energy = batch["mixture_mag"].to(device)
         keypoints = [k.to(device) for k in batch["keypoints"]]
         contexts = [c.to(device) for c in batch["contexts"]]
         targets = [t.to(device) for t in build_targets(batch, cfg["audio"]["mask_type"])]
 
-        masks = model(mix, keypoints, contexts)
-        loss = sum(criterion(m, t) for m, t in zip(masks, targets)) / len(masks)
+        masks = model(net_input, keypoints, contexts)
+        if cfg["audio"]["mask_type"] == "ratio":
+            loss = sum(criterion(m, t) for m, t in zip(masks, targets)) / len(masks)
+        else:
+            loss = energy_weighted_bce(masks, targets, energy,
+                                       cfg["audio"].get("loss_energy_floor", 0.0))
 
         optimizer.zero_grad()
         loss.backward()

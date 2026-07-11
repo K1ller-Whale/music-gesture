@@ -62,12 +62,62 @@ def mix_and_separate(waveforms: List[torch.Tensor]) -> Tuple[torch.Tensor, List[
 
 def build_log_freq_matrix(n_freq: int, n_log_freq: int,
                           sample_rate: int) -> np.ndarray:
-    """Linear->log frequency remap matrix (mel-like), shape [n_log_freq, n_freq]."""
+    """Linear->log frequency resampling matrix, shape [n_log_freq, n_freq].
+
+    Each log-spaced centre is a linear interpolation of the two bracketing
+    linear-frequency bins, so the matrix is row-stochastic (rows sum to 1) and
+    concentrates resolution on the low/mid band where instrument energy lives.
+    """
     f_max = sample_rate / 2
     lin = np.linspace(0, f_max, n_freq)
-    log_pts = np.logspace(np.log10(max(lin[1], 1.0)), np.log10(f_max), n_log_freq)
+    f0 = max(lin[1], 1.0)
+    log_pts = np.logspace(np.log10(f0), np.log10(f_max), n_log_freq)
     mat = np.zeros((n_log_freq, n_freq), dtype=np.float32)
     for i, center in enumerate(log_pts):
-        idx = np.argmin(np.abs(lin - center))
-        mat[i, idx] = 1.0
+        j = int(np.searchsorted(lin, center))
+        if j <= 0:
+            mat[i, 0] = 1.0
+        elif j >= n_freq:
+            mat[i, n_freq - 1] = 1.0
+        else:
+            lo, hi = lin[j - 1], lin[j]
+            w = (center - lo) / (hi - lo + 1e-12)
+            mat[i, j - 1] = 1.0 - w
+            mat[i, j] = w
     return mat
+
+
+def build_inv_log_freq_matrix(n_freq: int, n_log_freq: int,
+                              sample_rate: int) -> np.ndarray:
+    """Log->linear frequency resampling matrix, shape [n_freq, n_log_freq].
+
+    Inverse of ``build_log_freq_matrix``: maps a predicted mask back from the
+    log-frequency grid to the linear STFT grid for reconstruction. Each linear
+    bin linearly interpolates the two bracketing log-spaced points.
+    """
+    f_max = sample_rate / 2
+    lin = np.linspace(0, f_max, n_freq)
+    f0 = max(lin[1], 1.0)
+    log_pts = np.logspace(np.log10(f0), np.log10(f_max), n_log_freq)
+    mat = np.zeros((n_freq, n_log_freq), dtype=np.float32)
+    for i, f in enumerate(lin):
+        j = int(np.searchsorted(log_pts, f))
+        if j <= 0:
+            mat[i, 0] = 1.0
+        elif j >= n_log_freq:
+            mat[i, n_log_freq - 1] = 1.0
+        else:
+            lo, hi = log_pts[j - 1], log_pts[j]
+            w = (f - lo) / (hi - lo + 1e-12)
+            mat[i, j - 1] = 1.0 - w
+            mat[i, j] = w
+    return mat
+
+
+def warp_freq(mag: torch.Tensor, matrix: torch.Tensor) -> torch.Tensor:
+    """Resample the frequency axis of ``mag`` [..., Fin, T] with ``matrix`` [Fout, Fin].
+
+    Returns [..., Fout, T]. ``matrix`` broadcasts over any leading (batch/
+    channel) dimensions, so this works for [F, T], [C, F, T] and [B, C, F, T].
+    """
+    return torch.matmul(matrix.to(mag.dtype), mag)

@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from datasets.music_dataset import MusicMixDataset, collate  # noqa: E402
 from models import MusicGesture  # noqa: E402
 from models.synthesizer import apply_mask  # noqa: E402
-from utils.audio import istft, stft  # noqa: E402
+from utils.audio import istft, stft, warp_freq, build_inv_log_freq_matrix  # noqa: E402
 from utils.metrics import compute_sdr  # noqa: E402
 
 CONDITIONS = ["full", "zero_pose", "zero_ctx", "mask_0.5"]
@@ -58,7 +58,10 @@ def masks_for_condition(model, mix, keypoints, contexts, cond):
     return model(mix, keypoints, contexts)
 
 
-def reconstruct(mix_wav, mix_mag, mask, phase, cfg):
+def reconstruct(mix_wav, mix_mag, mask, phase, cfg, inv_warp=None):
+    if inv_warp is not None:
+        # Warp the (soft) log-frequency mask back to the linear STFT grid.
+        mask = warp_freq(mask, inv_warp)
     est_mag = apply_mask(mix_mag, mask)
     spec = est_mag.squeeze(1) * torch.exp(1j * phase)
     c = cfg["audio"]
@@ -110,6 +113,10 @@ def main():
     model.eval()
 
     c = cfg["audio"]
+    inv_warp = None
+    if c.get("log_freq"):
+        inv_warp = torch.from_numpy(build_inv_log_freq_matrix(
+            c["n_freq"], c["n_log_freq"], c["sample_rate"])).to(device)
     metrics = {cond: {"sdr": [], "sir": [], "sar": []} for cond in CONDITIONS}
     mstats = {cond: {"mean": [], "std": []} for cond in CONDITIONS}
     evaluated = skipped = 0
@@ -125,22 +132,23 @@ def main():
             skipped += 1
             continue
 
-        mix = batch["mixture_mag"].to(device)
+        net_input = batch["net_input"].to(device)
         keypoints = [k.to(device) for k in batch["keypoints"]]
         contexts = [ct.to(device) for ct in batch["contexts"]]
 
         mix_wav = batch["mixture_wav"].to(device)
         mix_spec = stft(mix_wav.squeeze(0), c["n_fft"], c["hop_length"], c["win_length"])
+        mix_mag = mix_spec.abs().unsqueeze(0).unsqueeze(0).to(device)
         phase = torch.angle(mix_spec).unsqueeze(0).to(device)
 
         ref_arr = np.stack(refs)
         for cond in CONDITIONS:
-            masks = masks_for_condition(model, mix, keypoints, contexts, cond)
+            masks = masks_for_condition(model, net_input, keypoints, contexts, cond)
             if cond != "mask_0.5":
                 mean, std = mask_stats(masks)
                 mstats[cond]["mean"].append(mean)
                 mstats[cond]["std"].append(std)
-            ests = [reconstruct(mix_wav, mix, mask, phase, cfg).squeeze(0).cpu().numpy()
+            ests = [reconstruct(mix_wav, mix_mag, mask, phase, cfg, inv_warp).squeeze(0).cpu().numpy()
                     for mask in masks]
             m = compute_sdr(ref_arr, np.stack(ests))
             for k in metrics[cond]:

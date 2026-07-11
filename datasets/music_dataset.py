@@ -40,6 +40,12 @@ class MusicMixDataset(Dataset):
         self.clip_len = int(cfg["audio"]["clip_seconds"] * self.sr)
         self.frame_size = cfg["video"]["frame_size"]
         self.samples = self._read_index(index_file)
+        self.log_freq = cfg["audio"].get("log_freq", False)
+        self.warp = None
+        if self.log_freq:
+            mat = A.build_log_freq_matrix(
+                cfg["audio"]["n_freq"], cfg["audio"]["n_log_freq"], self.sr)
+            self.warp = torch.from_numpy(mat)
 
     @staticmethod
     def _read_index(path: str) -> List[Dict[str, str]]:
@@ -95,13 +101,24 @@ class MusicMixDataset(Dataset):
 
         c = self.cfg["audio"]
         mix_spec = self._spec(mixture)
-        mix_mag = mix_spec.abs().unsqueeze(0)
-        src_mags = [self._spec(s).abs().unsqueeze(0) for s in sources]
+        mix_mag = mix_spec.abs()                       # [F, T] linear-frequency
+        src_mags = [self._spec(s).abs() for s in sources]
+        if self.warp is not None:
+            # Warp to a log-frequency grid so the empty high-frequency bins are
+            # compressed and resolution is concentrated where energy lives.
+            mix_mag = A.warp_freq(mix_mag, self.warp)
+            src_mags = [A.warp_freq(s, self.warp) for s in src_mags]
+        # Network input is the log-magnitude of the (optionally warped) mixture;
+        # mixture_mag stays linear-amplitude for the energy-weighted loss.
+        net_input = A.log_magnitude(mix_mag).unsqueeze(0)
+        mix_mag = mix_mag.unsqueeze(0)
+        src_mags = [s.unsqueeze(0) for s in src_mags]
 
         keypoints = [self._load_pose(s["pose_path"]) for s in chosen]
         contexts = [self._load_context(s["context_frame_path"]) for s in chosen]
 
         return {
+            "net_input": net_input,
             "mixture_mag": mix_mag,
             "mixture_wav": mixture,
             "source_mags": src_mags,
@@ -116,6 +133,7 @@ def collate(batch: List[Dict[str, object]]) -> Dict[str, object]:
     """Stack a batch of variable-source samples (fixed num_mix)."""
     num_mix = len(batch[0]["keypoints"])
     out: Dict[str, object] = {
+        "net_input": torch.stack([b["net_input"] for b in batch]),
         "mixture_mag": torch.stack([b["mixture_mag"] for b in batch]),
         "mixture_wav": torch.stack([b["mixture_wav"] for b in batch]),
         "source_mags": [torch.stack([b["source_mags"][i] for b in batch]) for i in range(num_mix)],

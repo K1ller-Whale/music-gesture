@@ -26,6 +26,7 @@ audio:
   n_log_freq: 256
   mask_type: binary         # {binary, ratio} - MG uses a binary IBM + per-pixel BCE
   mask_threshold: 0.7       # inference threshold to binarise the predicted mask (paper)
+  loss_energy_floor: 0.02   # BCE ignores T-F bins below this fraction of per-sample peak magnitude
   clip_grad: 5.0
 
 video:

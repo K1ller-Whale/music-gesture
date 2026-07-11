@@ -11,12 +11,16 @@ from torch.utils.data import DataLoader
 from datasets.music_dataset import MusicMixDataset, collate
 from models import MusicGesture
 from models.synthesizer import apply_mask
-from utils.audio import istft
+from utils.audio import istft, stft, warp_freq, build_inv_log_freq_matrix
 from utils.metrics import compute_sdr
 
 
-def reconstruct(mix_wav, mix_mag, mask, phase_spec, cfg):
+def reconstruct(mix_wav, mix_mag, mask, phase_spec, cfg, inv_warp=None):
     c = cfg["audio"]
+    if inv_warp is not None:
+        # Mask is predicted on the log-frequency grid; warp it back to the
+        # linear STFT grid before applying it to the mixture spectrogram.
+        mask = warp_freq(mask, inv_warp)
     if c["mask_type"] == "binary":
         # Paper: threshold the predicted mask at 0.7 to obtain a binary mask
         # before multiplying it with the mixture spectrogram.
@@ -47,20 +51,24 @@ def main():
 
     all_metrics = {"sdr": [], "sir": [], "sar": []}
     c = cfg["audio"]
+    inv_warp = None
+    if c.get("log_freq"):
+        inv_warp = torch.from_numpy(build_inv_log_freq_matrix(
+            c["n_freq"], c["n_log_freq"], c["sample_rate"])).to(device)
     for batch in loader:
-        mix = batch["mixture_mag"].to(device)
+        net_input = batch["net_input"].to(device)
         keypoints = [k.to(device) for k in batch["keypoints"]]
         contexts = [ct.to(device) for ct in batch["contexts"]]
-        masks = model(mix, keypoints, contexts)
+        masks = model(net_input, keypoints, contexts)
 
         mix_wav = batch["mixture_wav"]
-        from utils.audio import stft
         mix_spec = stft(mix_wav.squeeze(0), c["n_fft"], c["hop_length"], c["win_length"])
+        mix_mag = mix_spec.abs().unsqueeze(0).unsqueeze(0).to(device)   # [1,1,F,T] linear
         phase = torch.angle(mix_spec).unsqueeze(0).to(device)
 
         estimates, refs = [], []
         for i, mask in enumerate(masks):
-            est = reconstruct(mix_wav.to(device), mix, mask, phase, cfg)
+            est = reconstruct(mix_wav.to(device), mix_mag, mask, phase, cfg, inv_warp)
             estimates.append(est.squeeze(0).cpu().numpy())
             refs.append(batch["source_wavs"][i].squeeze(0).numpy())
         m = compute_sdr(np.stack(refs), np.stack(estimates))
