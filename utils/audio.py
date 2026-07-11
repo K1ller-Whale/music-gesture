@@ -38,18 +38,25 @@ def ideal_ratio_mask(source_mag: torch.Tensor,
 
 def ideal_binary_mask(source_mag: torch.Tensor,
                       other_mag: torch.Tensor) -> torch.Tensor:
-    """1 where this source dominates the sum of the others."""
-    return (source_mag > other_mag).float()
+    """1 where this source is at least as loud as the other sources.
+
+    This is the ideal binary mask used as the ground-truth target in Music
+    Gesture (Eq. 4): the label is the dominant source at each time-frequency
+    bin. Because the two per-source masks are (near-)complementary, the targets
+    are balanced ~50/50, so a constant prediction cannot minimise the loss.
+    """
+    return (source_mag >= other_mag).float()
 
 
 def mix_and_separate(waveforms: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     """Given N solo waveforms, return (mixture, sources).
 
-    The mixture is the (mean) sum; each source is the individual waveform. This
-    is the self-supervised signal used to train visual sound separation.
+    The mixture is the sum of the sources (standard Mix-and-Separate, as used
+    in Sound of Pixels / Music Gesture); each source is the individual
+    waveform. This is the self-supervised signal used to train separation.
     """
     stacked = torch.stack(waveforms, dim=0)
-    mixture = stacked.mean(dim=0)
+    mixture = stacked.sum(dim=0)
     return mixture, waveforms
 
 

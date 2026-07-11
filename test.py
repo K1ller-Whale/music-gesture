@@ -16,9 +16,13 @@ from utils.metrics import compute_sdr
 
 
 def reconstruct(mix_wav, mix_mag, mask, phase_spec, cfg):
+    c = cfg["audio"]
+    if c["mask_type"] == "binary":
+        # Paper: threshold the predicted mask at 0.7 to obtain a binary mask
+        # before multiplying it with the mixture spectrogram.
+        mask = (mask >= c.get("mask_threshold", 0.7)).float()
     est_mag = apply_mask(mix_mag, mask)
     spec = est_mag.squeeze(1) * torch.exp(1j * phase_spec)
-    c = cfg["audio"]
     return istft(spec, c["n_fft"], c["hop_length"], c["win_length"], length=mix_wav.shape[-1])
 
 

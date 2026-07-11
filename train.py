@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from datasets.music_dataset import MusicMixDataset, collate
 from models import MusicGesture
 from models.synthesizer import apply_mask
-from utils.audio import ideal_ratio_mask
+from utils.audio import ideal_ratio_mask, ideal_binary_mask
 
 
 def set_seed(seed: int) -> None:
@@ -27,13 +27,22 @@ def set_seed(seed: int) -> None:
 
 def build_targets(batch, mask_type: str):
     mix = batch["mixture_mag"]
+    src_mags = batch["source_mags"]
     targets = []
-    for src in batch["source_mags"]:
+    for i, src in enumerate(src_mags):
         if mask_type == "ratio":
             targets.append(ideal_ratio_mask(src, mix).clamp(0, 1))
         else:
-            other = mix - src
-            targets.append((src > other).float())
+            # Ideal binary mask (Music Gesture Eq. 4): 1 where this source is
+            # the dominant one at that time-frequency bin. Compare against the
+            # per-bin max of the *other* sources so the targets are balanced
+            # ~50/50 and a constant prediction can no longer win.
+            other = None
+            for j, s in enumerate(src_mags):
+                if j == i:
+                    continue
+                other = s if other is None else torch.maximum(other, s)
+            targets.append(ideal_binary_mask(src, other))
     return targets
 
 

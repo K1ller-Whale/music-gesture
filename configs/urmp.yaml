@@ -24,7 +24,8 @@ audio:
   n_freq: 512               # STFT freq bins (n_fft/2)
   log_freq: true            # warp to log-frequency scale
   n_log_freq: 256
-  mask_type: ratio          # {binary, ratio}
+  mask_type: binary         # {binary, ratio} - MG uses a binary IBM + per-pixel BCE
+  mask_threshold: 0.7       # inference threshold to binarise the predicted mask (paper)
   clip_grad: 5.0
 
 video:
