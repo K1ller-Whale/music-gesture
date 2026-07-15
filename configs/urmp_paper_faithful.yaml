@@ -33,9 +33,9 @@ audio:
   n_log_freq: 256
   mask_type: binary
   mask_target: literal_mix        # paper Eq. 4: S_k >= S_mix
-  loss_mode: bce_plain            # paper: plain per-pixel BCE
+  loss_mode: bce_energy_weighted  # paper target (literal_mix) kept; weight bins by energy to escape prior-collapse
   mask_threshold: 0.5
-  loss_energy_floor: 0.0          # unused under bce_plain
+  loss_energy_floor: 0.1          # ignore bins below 10% of each clip's peak magnitude
   clip_grad: 5.0
 
 video:
