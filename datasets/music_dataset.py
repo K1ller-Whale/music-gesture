@@ -6,12 +6,18 @@ Each index file row points to a preprocessed solo clip:
 ``__getitem__`` samples ``num_mix`` solos, mixes their audio, and returns the
 mixture spectrogram plus per-source keypoints/context/target so the model learns
 to separate a source conditioned on its gestures.
+
+P1 (temporal alignment): the audio clip and the keypoint sequence for each
+source are cropped from a single shared start time, so the gestures the fusion
+module sees actually correspond to the sound it must separate. The pose is also
+forced to exactly ``video.num_frames`` frames covering ``audio.clip_seconds`` so
+the two streams share the same temporal extent and batches stack cleanly.
 """
 from __future__ import annotations
 
 import csv
 import random
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -37,8 +43,14 @@ class MusicMixDataset(Dataset):
         self.split = split
         self.num_mix = cfg["data"]["num_mix"]
         self.sr = cfg["audio"]["sample_rate"]
-        self.clip_len = int(cfg["audio"]["clip_seconds"] * self.sr)
+        self.clip_seconds = float(cfg["audio"]["clip_seconds"])
+        self.clip_len = int(self.clip_seconds * self.sr)
         self.frame_size = cfg["video"]["frame_size"]
+        # Video timing. Used to crop the pose sequence to the SAME time window as
+        # the sampled audio clip (P1) and to force a fixed sequence length so the
+        # gesture and audio streams cover an identical span of time.
+        self.fps = int(cfg["video"]["fps"])
+        self.num_frames = int(cfg["video"]["num_frames"])
         self.samples = self._read_index(index_file)
         # Mixing policy for Mix-and-Separate (curriculum). 'random' = any other
         # solo; 'hetero' = a solo of a *different* instrument category; 'homo' =
@@ -73,26 +85,73 @@ class MusicMixDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _load_audio(self, path: str) -> torch.Tensor:
+    def _read_wav(self, path: str) -> np.ndarray:
+        """Read a mono waveform, padded up to at least one clip in length."""
         if sf is None:
             raise ImportError("soundfile is required to load audio")
-        wav, sr = sf.read(path, dtype="float32")
+        wav, _ = sf.read(path, dtype="float32")
         if wav.ndim > 1:
             wav = wav.mean(axis=1)
         if len(wav) < self.clip_len:
             wav = np.pad(wav, (0, self.clip_len - len(wav)))
-        start = random.randint(0, len(wav) - self.clip_len) if self.split == "train" else 0
-        return torch.from_numpy(wav[start:start + self.clip_len])
+        return wav
 
-    def _load_pose(self, path: str) -> torch.Tensor:
-        kp = np.load(path)  # [T, V, 3]
+    def _load_audio_pose(self, audio_path: str,
+                         pose_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load an audio clip and its keypoints cropped to the SAME time window.
+
+        A single ``start_sec`` is drawn once and used to crop *both* the audio
+        (in samples) and the pose (in frames), so the keypoints correspond to
+        the sound being separated (report P1). The window is chosen to fit
+        inside both streams, and the pose is forced to exactly ``num_frames``
+        frames (padding short tails by edge-repeat).
+        """
+        wav = self._read_wav(audio_path)
+        kp_full = np.load(pose_path)  # [T, V, 3] raw pixel coords + confidence
+        if kp_full.ndim != 3:
+            kp_full = kp_full.reshape(kp_full.shape[0], -1, 3)
+        n_pose = int(kp_full.shape[0])
+
+        audio_dur = len(wav) / float(self.sr)
+        pose_dur = n_pose / float(self.fps)
+        # Latest start that still leaves a full clip_seconds window inside BOTH
+        # the audio and the pose. For pre-segmented clips (audio == pose ==
+        # clip_seconds) this is 0, so both start at 0 and stay aligned; for
+        # longer source clips it draws a shared random window in training.
+        max_start = max(0.0, min(audio_dur, pose_dur) - self.clip_seconds)
+        if self.split == "train" and max_start > 0.0:
+            start_sec = random.uniform(0.0, max_start)
+        else:
+            start_sec = 0.0
+
+        # Audio crop (samples).
+        a0 = int(round(start_sec * self.sr))
+        a0 = max(0, min(a0, len(wav) - self.clip_len))
+        wav = wav[a0:a0 + self.clip_len]
+
+        # Pose crop (frames) from the SAME window, forced to num_frames.
+        f0 = int(round(start_sec * self.fps))
+        f0 = max(0, min(f0, max(0, n_pose - 1)))
+        kp = kp_full[f0:f0 + self.num_frames]
+        if kp.shape[0] < self.num_frames:
+            if kp.shape[0] == 0:
+                kp = np.zeros((self.num_frames, kp_full.shape[1],
+                               kp_full.shape[2]), np.float32)
+            else:
+                pad = self.num_frames - kp.shape[0]
+                kp = np.pad(kp, ((0, pad), (0, 0), (0, 0)), mode="edge")
+        kp = np.ascontiguousarray(kp)
+
         kp = normalize_keypoints(kp, self.frame_size, self.frame_size)
         if self.split == "train" and self.pose_augment:
             kp = augment_keypoints(
                 kp, translate=self.pose_jitter_translate,
                 scale=self.pose_jitter_scale,
                 rotate_deg=self.pose_jitter_rotate_deg)
-        return torch.from_numpy(kp).float()
+
+        wav_t = torch.from_numpy(np.ascontiguousarray(wav))
+        kp_t = torch.from_numpy(np.ascontiguousarray(kp)).float()
+        return wav_t, kp_t
 
     def _sample_others(self, idx: int) -> List[int]:
         """Pick num_mix-1 partner indices according to self.mix_policy.
@@ -134,7 +193,12 @@ class MusicMixDataset(Dataset):
         others = self._sample_others(idx)
         chosen += [self.samples[o] for o in others]
 
-        waveforms = [self._load_audio(s["audio_path"]) for s in chosen]
+        # P1: audio and keypoints for each source share one time window.
+        pairs = [self._load_audio_pose(s["audio_path"], s["pose_path"])
+                 for s in chosen]
+        waveforms = [p[0] for p in pairs]
+        keypoints = [p[1] for p in pairs]
+
         mixture, sources = A.mix_and_separate(waveforms)
 
         c = self.cfg["audio"]
@@ -152,7 +216,6 @@ class MusicMixDataset(Dataset):
         mix_mag = mix_mag.unsqueeze(0)
         src_mags = [s.unsqueeze(0) for s in src_mags]
 
-        keypoints = [self._load_pose(s["pose_path"]) for s in chosen]
         contexts = [self._load_context(s["context_frame_path"]) for s in chosen]
 
         return {

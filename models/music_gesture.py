@@ -48,6 +48,8 @@ class MusicGesture(nn.Module):
             body_joints=cfg["video"]["body_joints"], hand_joints=cfg["video"]["hand_joints"],
             context_mode=m["pose"].get("context_mode", "film"),
             stride_layers=tuple(m["pose"].get("stride_layers", (2, 4))),
+            context_inject_after=m["pose"].get("context_inject_after", 1),
+            context_proj_dim=m["pose"].get("context_proj_dim", 0),
         )
         self.fusion = AudioVisualFusion(
             dim=dim, depth=m["fusion"]["depth"], heads=m["fusion"]["heads"],

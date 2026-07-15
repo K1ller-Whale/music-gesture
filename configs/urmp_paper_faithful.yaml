@@ -72,6 +72,12 @@ model:
     dropout: 0.1
     embed_dim: 512
     context_mode: concat          # paper: concat context onto node features
+    # P2: concatenate context onto ENCODED node features (after 1 graph block),
+    # not the raw (x,y,conf) coords, and project the 2048-d context down to 128
+    # so it does not drown the keypoint channels. Set context_inject_after: 0 and
+    # context_proj_dim: 0 to restore the old raw-input, unprojected concat.
+    context_inject_after: 1
+    context_proj_dim: 128
   fusion:
     dim: 512
     depth: 3
