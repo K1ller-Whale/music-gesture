@@ -452,19 +452,36 @@ def main():
             writer.writeheader()
         for vi, (category, video) in enumerate(videos):
             name = os.path.splitext(os.path.basename(video))[0]
-            if args.pose == "alphapose":
-                frames, pose, crops = extract_video_alphapose(video, args)
-            elif args.pose == "mediapipe":
-                frames, pose, crops = extract_video_mediapipe(video, args, detectors)
-            else:
-                # zeros: still need frames for context + timing
-                frames_dir = os.path.join(args.tmp, "frames", name)
-                os.makedirs(frames_dir, exist_ok=True)
-                if not glob.glob(os.path.join(frames_dir, "*.jpg")):
-                    sh(["ffmpeg", "-y", "-i", video, "-vf",
-                        f"fps={args.fps},scale=-2:480", os.path.join(frames_dir, "%06d.jpg")])
-                frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
-                pose, crops = None, None
+            # Skip corrupt / truncated downloads. yt-dlp sometimes reports success
+            # for a broken file (e.g. a 51 KB "video") that ffmpeg cannot decode;
+            # without this guard one bad file crashes the whole batch.
+            try:
+                size = os.path.getsize(video)
+            except OSError:
+                size = 0
+            if size < 200 * 1024:
+                print(f"[{vi+1}/{len(videos)}] {category}/{name}: skipped "
+                      f"(bad download, {size} bytes)")
+                continue
+            # Never let a single unreadable video kill the run: skip and continue.
+            try:
+                if args.pose == "alphapose":
+                    frames, pose, crops = extract_video_alphapose(video, args)
+                elif args.pose == "mediapipe":
+                    frames, pose, crops = extract_video_mediapipe(video, args, detectors)
+                else:
+                    # zeros: still need frames for context + timing
+                    frames_dir = os.path.join(args.tmp, "frames", name)
+                    os.makedirs(frames_dir, exist_ok=True)
+                    if not glob.glob(os.path.join(frames_dir, "*.jpg")):
+                        sh(["ffmpeg", "-y", "-i", video, "-vf",
+                            f"fps={args.fps},scale=-2:480", os.path.join(frames_dir, "%06d.jpg")])
+                    frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+                    pose, crops = None, None
+            except Exception as e:
+                print(f"[{vi+1}/{len(videos)}] {category}/{name}: skipped "
+                      f"({type(e).__name__}: {e})")
+                continue
             if not frames:
                 print(f"[{vi+1}/{len(videos)}] {category}/{name}: skipped (no frames)")
                 continue
