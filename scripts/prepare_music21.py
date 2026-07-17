@@ -63,6 +63,18 @@ def sh(cmd):
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def extract_frames(video, frames_dir, args):
+    """Decode frames at args.fps. Honors args._max_seconds to cap how much of the
+    video is read (-t as an input option), which is the main speed lever: long
+    videos no longer cost minutes of pose inference on frames we never use."""
+    cmd = ["ffmpeg", "-y"]
+    if getattr(args, "_max_seconds", 0):
+        cmd += ["-t", str(args._max_seconds)]
+    cmd += ["-i", video, "-vf", f"fps={args.fps},scale=-2:480",
+            os.path.join(frames_dir, "%06d.jpg")]
+    sh(cmd)
+
+
 def fetch(url, path):
     if not os.path.exists(path):
         urllib.request.urlretrieve(url, path)
@@ -190,8 +202,7 @@ def extract_video_alphapose(video, args):
     frames_dir = os.path.join(args.tmp, "frames", name)
     os.makedirs(frames_dir, exist_ok=True)
     if not glob.glob(os.path.join(frames_dir, "*.jpg")):
-        sh(["ffmpeg", "-y", "-i", video, "-vf", f"fps={args.fps},scale=-2:480",
-            os.path.join(frames_dir, "%06d.jpg")])
+        extract_frames(video, frames_dir, args)
     frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
     T = len(frame_paths)
     size = args.frame_size
@@ -256,8 +267,7 @@ def extract_video_mediapipe(video, args, detectors):
     frames_dir = os.path.join(args.tmp, "frames", name)
     os.makedirs(frames_dir, exist_ok=True)
     if not glob.glob(os.path.join(frames_dir, "*.jpg")):
-        sh(["ffmpeg", "-y", "-i", video, "-vf", f"fps={args.fps},scale=-2:480",
-            os.path.join(frames_dir, "%06d.jpg")])
+        extract_frames(video, frames_dir, args)
     frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
     T = len(frame_paths)
     size = args.frame_size
@@ -347,7 +357,11 @@ def segment_and_write(name, category, video, frame_paths, pose, crops, args, wri
 
     wav_rs = os.path.join(args.tmp, f"{name}.wav")
     if not os.path.exists(wav_rs):
-        sh(["ffmpeg", "-y", "-i", video, "-ac", "1", "-ar", str(args.sr), wav_rs])
+        wcmd = ["ffmpeg", "-y"]
+        if getattr(args, "_max_seconds", 0):
+            wcmd += ["-t", str(args._max_seconds)]
+        wcmd += ["-i", video, "-ac", "1", "-ar", str(args.sr), wav_rs]
+        sh(wcmd)
     wav, _ = sf.read(wav_rs, dtype="float32")
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
@@ -416,8 +430,7 @@ def process_one(vi, total, category, video, args, detectors, writer):
             frames_dir = os.path.join(args.tmp, "frames", name)
             os.makedirs(frames_dir, exist_ok=True)
             if not glob.glob(os.path.join(frames_dir, "*.jpg")):
-                sh(["ffmpeg", "-y", "-i", video, "-vf",
-                    f"fps={args.fps},scale=-2:480", os.path.join(frames_dir, "%06d.jpg")])
+                extract_frames(video, frames_dir, args)
             frames = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
             pose, crops = None, None
     except Exception as e:
@@ -450,6 +463,14 @@ def main():
     ap.add_argument("--pose_stride", type=int, default=1)
     ap.add_argument("--max_per_cat", type=int, default=0, help="0 = all ids per category (download)")
     ap.add_argument("--max_videos", type=int, default=0, help="0 = all videos (preprocess)")
+    ap.add_argument("--max_clips_per_video", type=int, default=0,
+                    help="0 = whole video. Set e.g. 6 to only decode/pose the first "
+                         "N clips' worth of each video -- the biggest speed lever, "
+                         "since pose no longer runs on every frame of long videos.")
+    ap.add_argument("--shard", default="",
+                    help="process only shard idx/count of the video list, e.g. '0/2'. "
+                         "Run two processes (one per GPU) to use both T4s; each writes "
+                         "meta.part<idx>.csv -- concat them into meta.csv afterward.")
     ap.add_argument("--dl_height", type=int, default=480)
     ap.add_argument("--keep_videos", action="store_true",
                     help="keep source videos on disk (default: delete each after "
@@ -463,6 +484,17 @@ def main():
     ap.add_argument("--ap_detector", default="yolo")
     ap.add_argument("--ap_gpus", default="0")
     args = ap.parse_args()
+
+    # Cap how much of each video we decode/pose (huge speedup for long videos).
+    args._max_seconds = 0
+    if args.max_clips_per_video:
+        args._max_seconds = ((args.max_clips_per_video - 1) * args.seg_hop
+                             + args.clip_seconds + 1.0)
+    # Optional sharding across processes/GPUs.
+    args._shard_idx, args._shard_cnt = 0, 1
+    if args.shard:
+        _pi, _pc = args.shard.split("/")
+        args._shard_idx, args._shard_cnt = int(_pi), int(_pc)
 
     if sf is None or cv2 is None:
         raise SystemExit("pip install soundfile opencv-python (and mediapipe for --pose mediapipe)")
@@ -483,7 +515,8 @@ def main():
     elif args.pose == "mediapipe":
         tag = f" | stride: {args.pose_stride}"
 
-    meta_path = os.path.join(args.out, "meta.csv")
+    meta_name = "meta.csv" if args._shard_cnt == 1 else f"meta.part{args._shard_idx}.csv"
+    meta_path = os.path.join(args.out, meta_name)
     write_header = not os.path.exists(meta_path)
     with open(meta_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["clip", "category"])
@@ -505,6 +538,8 @@ def main():
                     pairs.append((cat, vid))
             if args.max_videos:
                 pairs = pairs[:args.max_videos]
+            if args._shard_cnt > 1:
+                pairs = pairs[args._shard_idx::args._shard_cnt]
             if not pairs:
                 raise SystemExit("no video ids found in --json")
             print(f"videos: {len(pairs)} (streaming) | pose mode: {args.pose}{tag} | "
@@ -533,6 +568,8 @@ def main():
             videos = find_videos_by_category(args.videos_root, cat_ids)
             if args.max_videos:
                 videos = videos[:args.max_videos]
+            if args._shard_cnt > 1:
+                videos = videos[args._shard_idx::args._shard_cnt]
             if not videos:
                 raise SystemExit(f"no videos found under {args.videos_root}")
             print(f"videos: {len(videos)} | pose mode: {args.pose}{tag}")
