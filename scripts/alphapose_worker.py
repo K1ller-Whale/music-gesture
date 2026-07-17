@@ -110,7 +110,19 @@ def main():
             time.sleep(0.2)
         writer.stop()
         det_loader.stop()
-        write_json(writer.results(), outdir, form=opt.format, for_eval=False)
+        # In this AlphaPose build, DataWriter.update() writes alphapose-results.json
+        # to opt.outputpath itself as it drains (the "Results have been written to
+        # json." line). The parent reads that file directly, so we must NOT re-derive
+        # it via writer.results(): this build does not populate .final_result in image
+        # mode (AttributeError). Only write it ourselves if the writer left no file,
+        # and guard results() across API variants.
+        result_json = os.path.join(outdir, "alphapose-results.json")
+        if not os.path.exists(result_json):
+            try:
+                final = writer.results()
+            except Exception:
+                final = getattr(writer, "final_result", []) or []
+            write_json(final, outdir, form=opt.format, for_eval=False)
 
     print("__AP_READY__", flush=True)
     for line in sys.stdin:
