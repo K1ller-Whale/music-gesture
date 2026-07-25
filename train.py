@@ -27,8 +27,8 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-from datasets.music_dataset import MusicMixDataset, collate
-from models import MusicGesture
+from datasets import build_dataset
+from models import build_model
 from models.synthesizer import apply_mask
 from utils.audio import ideal_ratio_mask, ideal_binary_mask, ideal_binary_mask_literal
 
@@ -116,13 +116,18 @@ def build_optimizer(model, cfg):
         groups = tcfg.get("param_groups", {}) or {}
         lr_af = groups.get("audio_fusion", 1e-2)
         lr_ga = groups.get("gcn_appearance", 1e-3)
+        # Separation-side modules (higher LR): audio U-Net + fusion + FiLM +
+        # vision-gated head. Visual-encoder side (lower LR): the ST-GCN pose net
+        # (Music Gesture) or the DDT motion + appearance backbones (SoM).
+        sep_prefixes = ("audio_net.", "fusion.", "som_fusion.", "film.",
+                        "vis_gate_w.", "vis_gate_b.")
         audio_fusion, gcn_appearance = [], []
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if name.startswith("audio_net.") or name.startswith("fusion."):
+            if name.startswith(sep_prefixes):
                 audio_fusion.append(p)
-            else:  # pose_net (GCN) + context_net (appearance) + mask_head
+            else:  # pose_net (GCN) or motion_net (DDT) + appearance/context
                 gcn_appearance.append(p)
         params = [
             {"params": audio_fusion, "lr": lr_af},
@@ -134,30 +139,53 @@ def build_optimizer(model, cfg):
               f"gcn+appearance: {len(gcn_appearance)} params @ lr {lr_ga}")
         return torch.optim.SGD(params, momentum=momentum, weight_decay=wd)
 
-    backbone_ids = set(id(p) for p in model.context_net.parameters())
+    backbone = getattr(model, "context_net", None)
+    if backbone is None:
+        backbone = getattr(model, "appearance_net", None)
+    backbone_params = list(backbone.parameters()) if backbone is not None else []
+    backbone_ids = set(id(p) for p in backbone_params)
     params = [
         {"params": [p for p in model.parameters() if id(p) not in backbone_ids],
          "lr": tcfg["lr"]},
-        {"params": list(model.context_net.parameters()),
+        {"params": backbone_params,
          "lr": tcfg["lr_backbone"]},
     ]
     print(f"[optim] Adam base lr {tcfg['lr']}, backbone lr {tcfg['lr_backbone']}")
     return torch.optim.Adam(params, weight_decay=wd)
 
 
+def visual_inputs(batch, device):
+    """Return the two per-source visual conditioning lists for either model.
+
+    Music Gesture -> (keypoints, contexts); Sound of Motions -> (motion,
+    first_frames). The separation model treats them positionally, so the train
+    loop stays architecture-agnostic.
+    """
+    if "motion" in batch:
+        a = [m.to(device) for m in batch["motion"]]
+        b = [f.to(device) for f in batch["first_frames"]]
+    else:
+        a = [k.to(device) for k in batch["keypoints"]]
+        b = [c.to(device) for c in batch["contexts"]]
+    return a, b
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch):
     model.train()
+    # [FIX #12] model.train() puts EVERY submodule back into train mode, so the
+    # backbone BatchNorm freeze has to be re-applied here, after each call.
+    if hasattr(model, "freeze_bn_stats"):
+        model.freeze_bn_stats()
     running = 0.0
     mask_type = cfg["audio"]["mask_type"]
     loss_mode = cfg["audio"].get("loss_mode", "bce_energy_weighted")
     for step, batch in enumerate(loader):
         net_input = batch["net_input"].to(device)
         energy = batch["mixture_mag"].to(device)
-        keypoints = [k.to(device) for k in batch["keypoints"]]
-        contexts = [c.to(device) for c in batch["contexts"]]
+        vis_a, vis_b = visual_inputs(batch, device)
         targets = [t.to(device) for t in build_targets(batch, cfg)]
 
-        masks = model(net_input, keypoints, contexts)
+        masks = model(net_input, vis_a, vis_b)
         if mask_type == "ratio":
             loss = sum(criterion(m, t) for m, t in zip(masks, targets)) / len(masks)
         elif loss_mode == "bce_plain":
@@ -186,12 +214,20 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
     optimizer + epoch to continue an interrupted run.
     """
     os.makedirs(out_dir, exist_ok=True)
-    train_set = MusicMixDataset(cfg["data"]["train_index"], cfg, split="train")
+    train_set, collate_fn = build_dataset(cfg, cfg["data"]["train_index"], "train")
     loader = DataLoader(train_set, batch_size=cfg["train"]["batch_size"], shuffle=True,
-                        num_workers=cfg["train"]["num_workers"], collate_fn=collate,
+                        num_workers=cfg["train"]["num_workers"], collate_fn=collate_fn,
                         drop_last=True)
 
-    model = MusicGesture(cfg).to(device)
+    model = build_model(cfg).to(device)
+    # Structural backbone swaps (external flow/I3D) must happen for every stage,
+    # before any checkpoint load, so state_dict keys stay consistent.
+    if hasattr(model, "setup_backbones"):
+        model.setup_backbones(cfg)
+    # Pretrained flow/I3D weights are only loaded on a truly fresh start; later
+    # curriculum stages inherit fine-tuned weights via init_from / resume.
+    if not init_from and not resume and hasattr(model, "load_pretrained_backbones"):
+        model.load_pretrained_backbones(cfg)
     optimizer = build_optimizer(model, cfg)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer, milestones=cfg["train"]["lr_steps"], gamma=cfg["train"]["lr_gamma"])
@@ -207,9 +243,28 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
         ckpt = torch.load(resume, map_location=device)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
+        # [FIX #5] Restore the LR scheduler. It used not to be saved, so on
+        # resume MultiStepLR was rebuilt with last_epoch = 0 while the optimizer
+        # restored its already-decayed LR -- the milestones then re-fired
+        # RELATIVE to the resume point, applying extra decays. Interrupting
+        # stage 0 at epoch 30 gave extra decays at absolute epochs 55 and 70,
+        # ending the stage at 1e-6 instead of the intended 1e-5. Silent, and it
+        # changes the effective schedule every time training is interrupted.
+        if ckpt.get("scheduler") is not None:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        else:
+            # Legacy checkpoint with no scheduler state. The optimizer already
+            # carries the correctly-decayed LR, so do NOT step the scheduler
+            # (that would decay a second time); just align its epoch counter so
+            # remaining milestones fire at the right ABSOLUTE epochs.
+            scheduler.last_epoch = ckpt["epoch"]
+            print("[resume] WARNING: checkpoint predates scheduler state; "
+                  f"aligning scheduler.last_epoch to {ckpt['epoch']}. "
+                  "LR history before this point may not match a clean run.")
         start_epoch = ckpt["epoch"] + 1
         best_loss = ckpt.get("best_loss", float("inf"))
-        print(f"[resume] continuing from epoch {start_epoch}")
+        print(f"[resume] continuing from epoch {start_epoch} "
+              f"(lr {[g['lr'] for g in optimizer.param_groups]})")
 
     for epoch in range(start_epoch, cfg["train"]["epochs"]):
         loss = train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch)
@@ -218,6 +273,8 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
         # Keep only a rolling last.pth (+ best.pth) so the output dir does not
         # fill up with one ~150MB file per epoch. Atomic write via tmp+rename.
         state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                 # [FIX #5] persist the LR schedule alongside the optimizer
+                 "scheduler": scheduler.state_dict(),
                  "epoch": epoch, "best_loss": min(best_loss, loss), "cfg": cfg}
         tmp = os.path.join(out_dir, "last.pth.tmp")
         torch.save(state, tmp)
@@ -267,17 +324,35 @@ def main():
 
     stages = cfg["train"].get("stages")
     if stages:
-        # Paper two-stage curriculum: run each stage sequentially, chaining
-        # weights from the previous stage's last checkpoint.
+        # Multi-stage curriculum: run each stage sequentially, chaining weights
+        # from the previous stage's last checkpoint. Runs are idempotent and
+        # resumable at epoch granularity -- re-invoking skips finished stages and
+        # resumes an interrupted stage from its own last.pth (critical for the
+        # long MUSIC-21 curriculum on a single GPU).
         prev_ckpt = None
         for si, stage in enumerate(stages):
             name = stage.get("name", f"stage{si}")
             stage_cfg = apply_stage(cfg, stage)
             out_dir = os.path.join(base_out, f"stage{si}_{name}")
-            print(f"=== curriculum stage {si}: {name} "
-                  f"(mix_policy={stage_cfg['data'].get('mix_policy')}, "
-                  f"epochs={stage_cfg['train']['epochs']}) ===")
-            prev_ckpt = train_model(stage_cfg, device, out_dir, init_from=prev_ckpt)
+            last = os.path.join(out_dir, "last.pth")
+            total_epochs = stage_cfg["train"]["epochs"]
+            resume = None
+            if os.path.isfile(last):
+                done_epoch = torch.load(last, map_location="cpu").get("epoch", -1)
+                if done_epoch >= total_epochs - 1:
+                    print(f"=== curriculum stage {si}: {name} already complete "
+                          f"(epoch {done_epoch}); skipping ===")
+                    prev_ckpt = last
+                    continue
+                resume = last
+                print(f"=== curriculum stage {si}: {name} resuming from epoch "
+                      f"{done_epoch + 1}/{total_epochs} ===")
+            else:
+                print(f"=== curriculum stage {si}: {name} "
+                      f"(mix_policy={stage_cfg['data'].get('mix_policy')}, "
+                      f"epochs={total_epochs}) ===")
+            prev_ckpt = train_model(stage_cfg, device, out_dir,
+                                    init_from=prev_ckpt, resume=resume)
         # Surface the final stage checkpoint at the top level for convenience.
         if prev_ckpt and os.path.isfile(prev_ckpt):
             shutil.copyfile(prev_ckpt, os.path.join(base_out, "last.pth"))

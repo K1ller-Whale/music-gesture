@@ -1,0 +1,183 @@
+# Sound of Motions (Zhao et al., ICCV 2019) - PAPER-FAITHFUL config, MUSIC-21.
+#
+# Reuses the repo's audio pipeline (11025 Hz STFT, log-freq warp, mix-and-
+# separate, binary dominant-source mask, energy-weighted BCE) and training
+# scaffolding, and swaps the visual branch to SoM's Deep Dense Trajectory (DDT)
+# motion net + ResNet-18 appearance net + appearance-gated fusion + FiLM
+# bottleneck conditioning.
+#
+# Build the layout with scripts/prepare_music21_som.py (audio + frames +
+# optional cached trajectories + first_frame + meta_som.csv), then
+# scripts/prepare_data.py for the train/val split.
+#
+# NOTE: values not pinned by the SoM text are annotated as [assumption] and
+# inherit the sibling reproduction's defaults; see docs/SOM_PAPER_SPEC.md.
+
+experiment:
+  name: som_music21_paper_faithful
+  seed: 1234
+  output_dir: runs/som_music21
+
+data:
+  root: datasets/processed
+  train_index: datasets/processed/train.csv
+  val_index: datasets/processed/val.csv
+  num_mix: 2
+  categories: 21
+  # Overridden per-stage by the curriculum during TRAINING. scripts/eval_som.py
+  # does NOT apply stage overrides, so this is the policy evaluation uses. Set
+  # it to 'homo' for a same-instrument eval, 'hetero' to match stage 1 training.
+  mix_policy: hetero
+
+audio:
+  sample_rate: 11025
+  # [FIX #6 + #10] Was 6.0. The visual window is num_frames/fps = 24/8 = 3.0 s,
+  # so a 6 s audio clip asked the model to separate 3 s of audio it never saw.
+  # It also silently disabled temporal augmentation: prepare_music21_som.py
+  # writes clips of exactly --clip_seconds, so in som_dataset._load_source
+  # max_start = audio_dur - clip_seconds = 0 and the random crop could never
+  # move (start_sec always 0.0 -> only frames 0-23 of the 48 extracted were
+  # ever read, identical clips every epoch for 100 epochs).
+  # Setting this to the visual window length fixes both: audio and video now
+  # cover the same 3 s, and with 6 s files already on disk the crop roams over
+  # [0, 3] s so all 48 frames get used. NO RE-PREP REQUIRED.
+  # [deviation] SoM's text mentions ~6 s clips but also 8 FPS x 24 frames = 3 s.
+  # Those are inconsistent; we match the explicit frame spec.
+  clip_seconds: 3.0
+  n_fft: 1022
+  hop_length: 256
+  win_length: 1022
+  n_freq: 512
+  log_freq: true
+  n_log_freq: 256
+  mask_type: binary
+  mask_target: dominant
+  loss_mode: bce_energy_weighted
+  mask_threshold: 0.5
+  loss_energy_floor: 0.1
+  clip_grad: 5.0
+
+video:
+  fps: 8                    # SoM: 8 FPS sampling
+  num_frames: 24            # SoM: 24 frames -> 23 flow fields per clip
+  frame_size: 224           # [assumption] standard ResNet/I3D input
+  motion_mode: auto         # 'auto' uses cached trajectories when present, else frames
+
+model:
+  type: som                 # selects SoundOfMotions in models/build_model
+  audio:
+    ngf: 64
+    num_downs: 4
+    input_nc: 1
+    output_nc: 32           # synthesizer feature-map channels (vision-gated head -> 1 mask)
+    conv_kernel: 3
+    up_kernel: 3
+    dilation: 1
+  # [FIX #12] Freeze pretrained BatchNorm running statistics in the appearance /
+  # I3D backbones. At batch_size 2 (forced by the 6 GB card) batch statistics
+  # are estimated from 2 samples and are extremely noisy, which destroys the
+  # ImageNet/Kinetics stats during fine-tuning. Standard practice for
+  # small-batch backbone fine-tuning. [hardware] Set false if you get a bigger
+  # GPU and can raise batch_size above ~16.
+  freeze_bn: true
+  motion:
+    freeze_flow: true       # PWC-Net kept fixed (Sintel prior)
+    # [FIX #2] Trajectories are RAW PIXEL DISPLACEMENTS (tens of pixels at
+    # 224x224). The I3D stem is inflated from rgb_imagenet.pt, pretrained on
+    # inputs in ~[-1, 1], so raw displacements sat 10-50x outside the
+    # backbone's training distribution and produced saturated, meaningless
+    # motion features -- matching the measured full - zero_motion ~= 0.
+    # Displacements are divided by this scale, then clamped to [-1, 1].
+    # [assumption] 20 px/frame is a generous bound on real motion at
+    # 224x224 / 8 FPS. Lower it if trajectories still saturate.
+    traj_norm_scale: 20.0
+    traj_clamp: true
+    freeze_i3d: false       # fine-tune I3D motion features
+    corr_radius: 4
+    i3d_dropout: 0.5
+    traj_grid_stride: 1     # 1 = dense trajectories; >1 subsamples for speed
+    # --- Pretrained backbone weights (this is what makes numbers match) ------
+    # Built-in loader path: point these at the downloaded checkpoints and the
+    # model calls <module>.load_pretrained() on a fresh start, printing how many
+    # tensors were populated. Leave null to train the flow/I3D from scratch
+    # (fine for smoke tests, NOT paper-faithful).
+    #   I3D  : git clone https://github.com/piergiaj/pytorch-i3d  -> models/rgb_imagenet.pt
+    #   PWC  : git clone https://github.com/sniklaus/pytorch-pwc  -> network-default.pytorch
+    i3d_weights: weights/rgb_imagenet.pt
+    flow_weights: weights/network-default.pytorch   # offline override; else PWC auto-downloads
+    # External-backend path (recommended for exact fidelity): keep the official
+    # module as the backbone instead of the clean-room one. Set impl to
+    # 'external' and give a factory 'pkg.module:function' that returns a module
+    # matching the contract in models/som.py::setup_backbones. The factory is
+    # called with the weights path above as its only argument.
+    # NOTE: the clean-room builtin loaders only partially absorb the official
+    # checkpoints (measured: I3D 17%, PWC 38% via scripts/check_weights.py), so
+    # use the external official backbones for a faithful reproduction.
+    i3d_impl: external      # external loads rgb_imagenet.pt exactly; runs on CPU/GPU
+    i3d_factory: som_backends.i3d:build_official_i3d
+    # PWC external needs a GPU + `pip install cupy-cuda12x` (no CPU support).
+    # No cupy? set flow_impl: builtin, flow_weights: null, freeze_flow: false to
+    # train flow from scratch (dependency-free but not paper-faithful).
+    flow_impl: external     # builtin | external
+    flow_factory: som_backends.pwc:build_official_pwc
+  appearance:
+    backbone: resnet18      # SoM: ResNet-18 over the first frame
+    pretrained: true
+    out_dim: 512
+  fusion:
+    dim: 512                # audio bottleneck / FiLM feature dim
+    visual_dim: 512         # fused visual feature width (f_v)
+    # [FIX #3] SoMFusion produces f_v_time [B, T', Kv] (per-timestep visual
+    # feature) and f_v_vec (its temporal mean). Previously ONLY f_v_vec reached
+    # the audio net, so *when* each source moved -- the exact signal SoM relies
+    # on to separate two same-instrument sources -- was averaged away before
+    # conditioning. With this enabled the FiLM modulation is resampled onto the
+    # bottleneck time axis and applied per time step.
+    temporal_film: true
+
+train:
+  # [hardware] batch_size=8 assumes a bigger-VRAM GPU. SoM's motion branch
+  # (PWC-Net optical flow + I3D 3D-conv over the trajectory volume, run once
+  # PER SOURCE -- so x2 at num_mix=2) is far heavier than Music Gesture's
+  # ST-GCN-over-keypoints branch, which has no per-frame CNN/flow cost at all.
+  # That's why this config saturates a 6GB card (e.g. GTX 1660 Ti) while Music
+  # Gesture trains fine. Lower batch_size (and num_workers, for system RAM/CPU)
+  # to fit; raise it back once you precompute trajectories with
+  # `scripts/prepare_music21_som.py --cache_trajectories`, which removes the
+  # repeated on-the-fly PWC-Net flow pass from every training step.
+  batch_size: 2
+  num_workers: 2
+  epochs: 100
+  lr: 0.001                 # unused under sgd (see param_groups)
+  lr_backbone: 0.0001
+  weight_decay: 0.0001
+  lr_steps: [40, 80]
+  lr_gamma: 0.1
+  optimizer: sgd            # SoM: SGD momentum 0.9
+  momentum: 0.9
+  param_groups:
+    audio_fusion: 0.001     # SoM: 1e-3 for separation net + fusion
+    gcn_appearance: 0.0001  # SoM: 1e-4 for motion + appearance backbones
+  log_interval: 20
+  ckpt_interval: 1
+  # SoM 3-stage curriculum: different-instrument -> same-instrument ->
+  # same-video (different shots). Each stage warm-starts from the previous.
+  stages:
+    - name: s1_different_instrument
+      mix_policy: hetero
+      epochs: 50
+      lr_steps: [25, 40]
+    - name: s2_same_instrument
+      mix_policy: homo
+      epochs: 30
+      lr_steps: [15, 25]
+      lr_scale: 0.1
+    - name: s3_same_video
+      mix_policy: same_video
+      epochs: 20
+      lr_steps: [10, 16]
+      lr_scale: 0.01
+
+eval:
+  metrics: [sdr, sir, sar]
+  ablations: [full, zero_motion, zero_appearance, mask_0.5]

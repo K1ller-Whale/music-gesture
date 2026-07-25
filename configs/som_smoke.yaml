@@ -1,0 +1,111 @@
+# Sound of Motions -- FAST END-TO-END SMOKE (real pipeline, tiny data).
+#
+# Same architecture and audio/video pipeline as som_paper_faithful.yaml, but a
+# tiny single-stage run over a handful of clips so you can confirm the whole
+# loop works with the real pretrained backbones before the multi-hour
+# curriculum: dataset -> STFT / log-freq -> mix-and-separate -> external
+# I3D+PWC-Net -> fusion -> loss.backward -> SGD step -> checkpoint.
+#
+# Fastest path (no MUSIC-21 download -- synthetic tiny data):
+#   python scripts/make_smoke_data.py --out datasets/smoke --n 6 --val-n 4
+#   python train.py --config configs/som_smoke.yaml
+# Real-data path (once you have a prepared SoM index) -- carve a subset into the
+# same location this config reads:
+#   python scripts/make_smoke_subset.py \
+#       --train-index datasets/processed/train.csv \
+#       --val-index   datasets/processed/val.csv --n 6 --val-n 4
+#   python train.py --config configs/som_smoke.yaml
+# Expect: the per-step loss should trend DOWN within a few epochs (a handful of
+# clips overfits fast -- that is the point of the sanity check).
+
+experiment:
+  name: som_smoke
+  seed: 0
+  output_dir: runs/som_smoke
+
+data:
+  root: datasets/processed
+  train_index: datasets/smoke/train.csv
+  val_index: datasets/smoke/val.csv
+  num_mix: 2
+  categories: 21
+  mix_policy: hetero        # needs >=2 categories in the subset
+
+audio:
+  sample_rate: 11025
+  clip_seconds: 6.0
+  n_fft: 1022
+  hop_length: 256
+  win_length: 1022
+  n_freq: 512
+  log_freq: true
+  n_log_freq: 256
+  mask_type: binary
+  mask_target: dominant
+  loss_mode: bce_energy_weighted
+  mask_threshold: 0.5
+  loss_energy_floor: 0.1
+  clip_grad: 5.0
+
+video:
+  fps: 8
+  num_frames: 24            # 23 flow fields per clip
+  frame_size: 224
+  motion_mode: auto         # cached trajectories when present, else raw frames
+
+model:
+  type: som
+  audio:
+    ngf: 64
+    num_downs: 4
+    input_nc: 1
+    output_nc: 32
+    conv_kernel: 3
+    up_kernel: 3
+    dilation: 1
+  motion:
+    freeze_flow: true
+    freeze_i3d: false
+    corr_radius: 4
+    i3d_dropout: 0.5
+    traj_grid_stride: 1
+    i3d_weights: weights/rgb_imagenet.pt
+    flow_weights: weights/network-default.pytorch
+    # External official backbones (same faithful setup as the paper config).
+    # No GPU/cupy for PWC? switch to: flow_impl: builtin, flow_weights: null,
+    # freeze_flow: false (dependency-free, flow trains from scratch).
+    i3d_impl: external
+    i3d_factory: som_backends.i3d:build_official_i3d
+    flow_impl: external
+    flow_factory: som_backends.pwc:build_official_pwc
+  appearance:
+    backbone: resnet18
+    pretrained: true
+    out_dim: 512
+  fusion:
+    dim: 512
+    visual_dim: 512
+
+train:
+  batch_size: 2
+  num_workers: 0            # single-process: avoids Windows spawn/cv2 issues
+  epochs: 5                 # tiny: enough to see the loss move
+  lr: 0.001
+  lr_backbone: 0.0001
+  weight_decay: 0.0001
+  lr_steps: [100]           # effectively no decay during the smoke
+  lr_gamma: 0.1
+  optimizer: sgd
+  momentum: 0.9
+  param_groups:
+    audio_fusion: 0.001
+    gcn_appearance: 0.0001
+  log_interval: 1
+  ckpt_interval: 1
+  # No 'stages' key -> single-stage run straight into output_dir, and
+  # load_pretrained_backbones() runs (fresh start) so the official I3D/PWC-Net
+  # weights are loaded.
+
+eval:
+  metrics: [sdr, sir, sar]
+  ablations: [full, zero_motion, zero_appearance, mask_0.5]

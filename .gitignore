@@ -1,6 +1,8 @@
 # Python
+*.pyc
 __pycache__/
 *.py[cod]
+*.cpython-312
 *.egg-info/
 .venv/
 venv/
@@ -23,3 +25,9 @@ checkpoints/
 .DS_Store
 .idea/
 .vscode/
+*.pt
+*.pytorch
+_m21_tmp0/
+datasets/smoke/
+pytorch-i3d/
+pytorch-pwc/
