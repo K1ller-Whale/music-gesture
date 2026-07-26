@@ -41,6 +41,35 @@ from utils.metrics import compute_sdr, compute_sdr_per_source  # noqa: E402,F401
 CONDITIONS = ["full", "zero_motion", "zero_appearance", "mask_0.5"]
 
 
+def _mask_summary(masks):
+    """(mean value, mean per-sample spatial std) over a list of [B,1,F,T] masks.
+
+    A spatial std near 0 means the mask is near-constant across the
+    spectrogram -- the signature of a collapsed, input-independent mask.
+    """
+    means, stds = [], []
+    for m in masks:
+        m = m.detach()
+        means.append(m.mean().item())
+        stds.append(m.flatten(1).std(dim=1).mean().item())
+    return float(np.mean(means)), float(np.mean(stds))
+
+
+def _mask_l1(a, b):
+    """Mean |a - b| over paired masks: how far an ablation MOVES the mask.
+
+    This separates two very different failures that SDR alone cannot tell
+    apart. If ablating a branch leaves the mask numerically identical, that
+    branch is architecturally disconnected (a bug). If it moves the mask but
+    SDR is unchanged, the branch is wired up and simply is not a useful cue
+    yet -- which is the expected situation early in the hetero stage.
+    """
+    vals = []
+    for x, y in zip(a, b):
+        vals.append((x.detach() - y.detach()).abs().mean().item())
+    return float(np.mean(vals))
+
+
 def masks_for_condition(model, net_input, motion, first_frames, cond):
     """Predicted masks per source under an ablation condition.
 
@@ -90,6 +119,8 @@ def evaluate_n(cfg, model, device, n_sources, args):
     metrics = {cond: defaultdict(list) for cond in CONDITIONS}
     per_inst = defaultdict(list)   # category -> full-condition SDR
     evaluated = skipped = 0
+    mstats = {cond: {"mean": [], "std": []} for cond in CONDITIONS if cond != "mask_0.5"}
+    mdelta = {"zero_motion": [], "zero_appearance": []}
 
     for batch in loader:
         if evaluated >= args.n:
@@ -111,8 +142,10 @@ def evaluate_n(cfg, model, device, n_sources, args):
         mix_mag = mix_spec.abs().unsqueeze(0).unsqueeze(0).to(device)
         phase = torch.angle(mix_spec).unsqueeze(0).to(device)
 
+        cond_masks = {}
         for cond in CONDITIONS:
             masks = masks_for_condition(model, net_input, motion, first_frames, cond)
+            cond_masks[cond] = masks
             ests = [reconstruct(mix_wav, mix_mag, mk, phase, cfg, inv_warp, threshold)
                     .squeeze(0).cpu().numpy() for mk in masks]
             # [FIX #8] Per-SOURCE scores. The summary table still reports the
@@ -129,6 +162,14 @@ def evaluate_n(cfg, model, device, n_sources, args):
                 for i, cat in enumerate(cats):
                     if i < len(ps["sdr"]):
                         per_inst[cat].append(float(ps["sdr"][i]))
+
+        # Mask-level diagnostics: does each branch actually move the mask?
+        for cond in mstats:
+            mm, ms = _mask_summary(cond_masks[cond])
+            mstats[cond]["mean"].append(mm)
+            mstats[cond]["std"].append(ms)
+        for cond in mdelta:
+            mdelta[cond].append(_mask_l1(cond_masks["full"], cond_masks[cond]))
         evaluated += 1
 
     print(f"\n===== N = {n_sources} sources =====")
@@ -150,6 +191,22 @@ def evaluate_n(cfg, model, device, n_sources, args):
     print(f"  full - zero_motion     = {f_sdr - zm:+.3f}  (>0 => motion helps)")
     print(f"  full - zero_appearance = {f_sdr - za:+.3f}  (>0 => appearance helps)")
 
+    print("\nMask diagnostics:")
+    print(f"  {'condition':<16} {'mask_mean':>10} {'mask_std':>9}")
+    for cond in CONDITIONS:
+        if cond == "mask_0.5":
+            continue
+        mm = float(np.mean(mstats[cond]["mean"])) if mstats[cond]["mean"] else float("nan")
+        ms = float(np.mean(mstats[cond]["std"])) if mstats[cond]["std"] else float("nan")
+        print(f"  {cond:<16} {mm:>10.4f} {ms:>9.4f}")
+    for cond in ("zero_motion", "zero_appearance"):
+        d = float(np.mean(mdelta[cond])) if mdelta[cond] else float("nan")
+        print(f"  mean |mask_full - mask_{cond}|{'':<3} = {d:.6f}")
+    print("  (mask_std ~0 => collapsed constant mask; "
+          "|mask_full - mask_zero_motion| ~0 => the motion branch has NO\n"
+          "   influence on the mask at all, i.e. a wiring bug rather than an "
+          "unused cue)")
+
     if args.per_instrument and per_inst:
         print("\nPer-instrument SDR (full):")
         for cat in sorted(per_inst):
@@ -168,10 +225,22 @@ def main():
     ap.add_argument("--seed", type=int, default=None,
                     help="RNG seed for mixture partner sampling "
                          "(default: experiment.seed from the config)")
+    ap.add_argument("--mix-policy", choices=["random", "hetero", "homo", "same_video"],
+                    default=None,
+                    help="Override data.mix_policy for THIS eval run only, without "
+                         "editing the config file. Useful for checking whether a "
+                         "branch (e.g. motion) matters more on harder pairings, "
+                         "e.g. --mix-policy homo to force same-instrument mixtures "
+                         "against a checkpoint trained on a different policy. Does "
+                         "not touch train.stages[i].mix_policy, which eval never "
+                         "reads in the first place.")
     args = ap.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
+
+    if args.mix_policy is not None:
+        cfg.setdefault("data", {})["mix_policy"] = args.mix_policy
 
     # [FIX #7] Seed the evaluation. The val dataset picks each mixture's partner
     # sources with random.sample on every __getitem__ (only start_sec was

@@ -27,7 +27,7 @@ data:
   # Overridden per-stage by the curriculum during TRAINING. scripts/eval_som.py
   # does NOT apply stage overrides, so this is the policy evaluation uses. Set
   # it to 'homo' for a same-instrument eval, 'hetero' to match stage 1 training.
-  mix_policy: hetero
+  mix_policy: random
 
 audio:
   sample_rate: 11025

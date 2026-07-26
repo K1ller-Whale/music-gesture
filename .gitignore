@@ -31,3 +31,5 @@ _m21_tmp0/
 datasets/smoke/
 pytorch-i3d/
 pytorch-pwc/
+*.png
+*.txt

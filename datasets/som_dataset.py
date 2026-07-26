@@ -12,8 +12,10 @@ visual conditioning is SoM's motion + appearance instead of pose keypoints:
 Index CSV schema (one preprocessed solo clip per row):
     audio_path, frames_dir, trajectory_path, first_frame_path,
     category, video_id, shot_id, clip_start_sec
-``trajectory_path`` may be empty (then frames_dir is used). ``video_id`` /
-``shot_id`` drive the curriculum's same-video sampling policy.
+``trajectory_path`` may be empty (then frames_dir is used). ``video_id`` drives
+the curriculum's same-video sampling policy (any other clip from the same
+video_id; see [FIX #15] below -- ``shot_id`` is used only for DDT trajectory
+tracking, not for same-video pairing).
 
 The audio clip and the visual clip are cropped from one shared start time so the
 motion the fusion module sees corresponds to the sound it must separate (the P1
@@ -179,8 +181,18 @@ class MusicMixSoMDataset(Dataset):
             pool = [j for j in range(len(self.samples))
                     if self.samples[j].get("category", "") != cat]
         elif self.mix_policy == "same_video":
-            pool = [j for j in self.by_video.get(vid, [])
-                    if j != idx and self.samples[j].get("shot_id", "") != anchor.get("shot_id", "")]
+            # [FIX #15] Only require a DIFFERENT CLIP from the same video, not
+            # a different shot. Clip windows are already tiled non-overlapping
+            # in time (prepare_music21_som.py::select_clip_windows), so any
+            # other same-video clip already has distinct motion content --
+            # shot_id is a DDT-tracking concept (avoid trajectory drift across
+            # a cut), not a pairing-diversity requirement. Requiring a
+            # different shot_id left the pool empty for every single-shot
+            # video, silently falling back to fully global random pairing
+            # (any video, any category) for 694/809 (85.8%) of a real
+            # MUSIC-21 corpus -- defeating this stage's entire purpose of
+            # forcing motion-based separation on same-appearance pairs.
+            pool = [j for j in self.by_video.get(vid, []) if j != idx]
         else:
             pool = [j for j in range(len(self.samples)) if j != idx]
         if len(pool) < self.num_mix - 1:
