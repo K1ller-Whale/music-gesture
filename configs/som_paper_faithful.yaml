@@ -160,6 +160,12 @@ train:
     gcn_appearance: 0.0001  # SoM: 1e-4 for motion + appearance backbones
   log_interval: 20
   ckpt_interval: 1
+  # [FIX #16] Write last.pth every N steps as well as at each epoch end, so an
+  # interrupted run loses at most N steps instead of a whole epoch (~48 min at
+  # batch_size 2 on a 6GB card). Resume is exact: the checkpoint also carries the
+  # step index, the epoch's partial running loss, and a full RNG snapshot.
+  # Set to 0 to disable mid-epoch saving. Each save rewrites ~150MB.
+  save_every_steps: 500
   # SoM 3-stage curriculum: different-instrument -> same-instrument ->
   # same-video (different shots). Each stage warm-starts from the previous.
   stages:

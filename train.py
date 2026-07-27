@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from datasets import build_dataset
 from models import build_model
@@ -38,6 +38,137 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def capture_rng_state():
+    """[FIX #16] Snapshot every RNG that influences a training step.
+
+    ``set_seed`` only runs once per process, so an interrupted run used to
+    restart its random stream from the configured seed. Because mix-and-separate
+    *synthesises* its data, that silently changed which mixtures each epoch saw:
+    the first epoch after a resume replayed the draws the run's very first epoch
+    had consumed, making epoch-to-epoch loss comparisons meaningless.
+    """
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": None,
+    }
+    if torch.cuda.is_available():
+        try:
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        except Exception:  # pragma: no cover - driver/device mismatch
+            state["cuda"] = None
+    return state
+
+
+def restore_rng_state(state) -> None:
+    """[FIX #16] Restore the RNG snapshot written by ``capture_rng_state``.
+
+    ``torch.load(..., map_location=device)`` moves *every* tensor in the
+    checkpoint, including the ByteTensor RNG states, so they are forced back to
+    CPU here -- ``torch.set_rng_state`` rejects CUDA tensors.
+    """
+    if not state:
+        print("[resume] WARNING: checkpoint predates RNG-state saving; the "
+              "random stream restarts from the configured seed, so this run's "
+              "mixtures will not match an uninterrupted run.")
+        return
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        cpu_state = state["torch"]
+        if hasattr(cpu_state, "cpu"):
+            cpu_state = cpu_state.cpu()
+        torch.set_rng_state(cpu_state)
+        cuda = state.get("cuda")
+        if cuda and torch.cuda.is_available():
+            cuda = [c.cpu() if hasattr(c, "cpu") else c for c in cuda]
+            if len(cuda) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all(cuda)
+        print("[resume] restored python/numpy/torch RNG state")
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[resume] WARNING: could not restore RNG state ({exc}); "
+              "continuing with the freshly seeded stream")
+
+
+def _epoch_seed(base_seed: int, epoch: int) -> int:
+    return (int(base_seed) * 1000003 + int(epoch)) % (2 ** 31 - 1)
+
+
+def seed_epoch_rng(base_seed: int, epoch: int) -> None:
+    """[FIX #16] Seed the MAIN-process RNGs for ``num_workers: 0`` runs.
+
+    With workers the dataset's draws are seeded by ``WorkerInit``; with
+    ``num_workers: 0`` there is no worker, so the epoch is keyed here instead.
+    """
+    s = _epoch_seed(base_seed, epoch)
+    random.seed(s)
+    np.random.seed(s)
+
+
+class WorkerInit:
+    """[FIX #16] Key each worker's RNG to (seed, epoch, worker_id).
+
+    The SoM dataset draws its clip offset (``random.uniform``) and its mixing
+    partner (``random.sample``) from python's global RNG *inside the worker*.
+    PyTorch seeds workers from a base seed pulled off the global torch RNG, so
+    those draws depended on how far the stream had advanced. Keying them to the
+    epoch makes an epoch's mixtures a pure function of the config instead.
+
+    [FIX #17] This MUST be a module-level class, not a closure. On Windows and
+    macOS the DataLoader start method is ``spawn``, which *pickles*
+    ``worker_init_fn`` into each worker; a local function fails with
+    ``AttributeError: Can't pickle local object``. Only the sampler reference
+    (plain ints) and the base seed are carried across, so this pickles fine.
+    Reading ``self.sampler.epoch`` also stays correct under spawn: the sampler is
+    pickled when the iterator is created, i.e. after ``set_epoch`` has run.
+    """
+
+    def __init__(self, base_seed: int, sampler):
+        self.base_seed = int(base_seed)
+        self.sampler = sampler
+
+    def __call__(self, worker_id: int) -> None:
+        s = ((_epoch_seed(self.base_seed, self.sampler.epoch) * 977 + worker_id)
+             % (2 ** 31 - 1))
+        random.seed(s)
+        np.random.seed(s)
+        torch.manual_seed(s)
+
+
+class ResumableRandomSampler(Sampler):
+    """[FIX #16] Deterministic per-epoch shuffle with a resumable prefix skip.
+
+    ``DataLoader(shuffle=True)`` draws its permutation from the *global* torch
+    RNG, so an epoch's order depended on how many draws the process had already
+    made -- which is why a resumed "epoch 11" trained on different data than an
+    uninterrupted "epoch 11". Deriving the permutation from (seed, epoch) makes
+    each epoch reproducible regardless of interruptions, and lets a mid-epoch
+    resume drop exactly the items it already consumed *without re-loading them*
+    (important here: trajectories are computed on the fly, so fast-forwarding
+    through a DataLoader would cost nearly as much as training the steps).
+    """
+
+    def __init__(self, num_samples: int, seed: int, epoch: int = 0, skip: int = 0):
+        self.num_samples = int(num_samples)
+        self.seed = int(seed)
+        self.epoch = int(epoch)
+        self.skip = int(skip)
+
+    def set_epoch(self, epoch: int, skip: int = 0) -> None:
+        self.epoch = int(epoch)
+        self.skip = max(0, min(int(skip), self.num_samples))
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(_epoch_seed(self.seed, self.epoch))
+        perm = torch.randperm(self.num_samples, generator=g).tolist()
+        return iter(perm[self.skip:])
+
+    def __len__(self) -> int:
+        return max(0, self.num_samples - self.skip)
 
 
 def build_targets(batch, cfg):
@@ -170,16 +301,24 @@ def visual_inputs(batch, device):
     return a, b
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch):
+def train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch,
+                    step_offset=0, running_init=0.0, total_steps=None,
+                    save_cb=None):
     model.train()
     # [FIX #12] model.train() puts EVERY submodule back into train mode, so the
     # backbone BatchNorm freeze has to be re-applied here, after each call.
     if hasattr(model, "freeze_bn_stats"):
         model.freeze_bn_stats()
-    running = 0.0
+    # [FIX #16] `running` / `step_offset` carry the interrupted epoch's partial
+    # sum forward, so the printed running mean stays continuous across a resume.
+    running = float(running_init)
+    total = int(total_steps) if total_steps else len(loader)
     mask_type = cfg["audio"]["mask_type"]
     loss_mode = cfg["audio"].get("loss_mode", "bce_energy_weighted")
-    for step, batch in enumerate(loader):
+    # [FIX #16] mid-epoch checkpoint cadence in steps; 0 disables.
+    save_every = int(cfg["train"].get("save_every_steps", 0) or 0)
+    for local_step, batch in enumerate(loader):
+        step = step_offset + local_step
         net_input = batch["net_input"].to(device)
         energy = batch["mixture_mag"].to(device)
         vis_a, vis_b = visual_inputs(batch, device)
@@ -200,10 +339,17 @@ def train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch):
         optimizer.step()
 
         running += loss.item()
+        done = step + 1
         if step % cfg["train"]["log_interval"] == 0:
-            avg = running / (step + 1)
-            print(f"epoch {epoch} step {step}/{len(loader)} loss {avg:.4f}")
-    return running / max(1, len(loader))
+            print(f"epoch {epoch} step {step}/{total} loss {running / done:.4f}")
+        # [FIX #16] Periodic mid-epoch checkpoint: an interrupted run now loses
+        # at most `save_every_steps` steps instead of a whole ~48 minute epoch.
+        # Skipped at the epoch boundary, where the epoch-end save already fires.
+        if (save_cb is not None and save_every
+                and done % save_every == 0 and done < total):
+            save_cb(epoch, step, running)
+            print(f"[ckpt] mid-epoch save at epoch {epoch} step {step}")
+    return running / max(1, total)
 
 
 def train_model(cfg, device, out_dir, init_from=None, resume=None):
@@ -215,9 +361,18 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
     """
     os.makedirs(out_dir, exist_ok=True)
     train_set, collate_fn = build_dataset(cfg, cfg["data"]["train_index"], "train")
-    loader = DataLoader(train_set, batch_size=cfg["train"]["batch_size"], shuffle=True,
-                        num_workers=cfg["train"]["num_workers"], collate_fn=collate_fn,
-                        drop_last=True)
+    batch_size = cfg["train"]["batch_size"]
+    num_workers = cfg["train"]["num_workers"]
+    base_seed = int(cfg["experiment"]["seed"])
+    # [FIX #16] Replace shuffle=True with a (seed, epoch)-keyed sampler so each
+    # epoch's order is reproducible and a mid-epoch resume can skip consumed
+    # items by index rather than by re-reading them through the DataLoader.
+    sampler = ResumableRandomSampler(len(train_set), base_seed)
+    steps_per_epoch = len(train_set) // batch_size
+    loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler,
+                        num_workers=num_workers, collate_fn=collate_fn,
+                        drop_last=True,
+                        worker_init_fn=WorkerInit(base_seed, sampler))
 
     model = build_model(cfg).to(device)
     # Structural backbone swaps (external flow/I3D) must happen for every stage,
@@ -234,6 +389,8 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
     criterion = nn.L1Loss() if cfg["audio"]["mask_type"] == "ratio" else nn.BCELoss()
 
     start_epoch = 0
+    start_step = 0
+    running_init = 0.0
     best_loss = float("inf")
     if init_from and os.path.isfile(init_from):
         ckpt = torch.load(init_from, map_location=device)
@@ -261,24 +418,55 @@ def train_model(cfg, device, out_dir, init_from=None, resume=None):
             print("[resume] WARNING: checkpoint predates scheduler state; "
                   f"aligning scheduler.last_epoch to {ckpt['epoch']}. "
                   "LR history before this point may not match a clean run.")
-        start_epoch = ckpt["epoch"] + 1
+        # [FIX #16] `step` is the last COMPLETED step of `epoch`; -1 (or a
+        # missing key, for pre-FIX#16 checkpoints) means the epoch finished, so
+        # old checkpoints keep resuming at epoch granularity exactly as before.
+        ck_step = int(ckpt.get("step", -1))
+        if ck_step < 0:
+            start_epoch, start_step, running_init = ckpt["epoch"] + 1, 0, 0.0
+        else:
+            start_epoch = ckpt["epoch"]
+            start_step = ck_step + 1
+            running_init = float(ckpt.get("running", 0.0))
+            if start_step >= steps_per_epoch:  # nothing left in that epoch
+                start_epoch, start_step, running_init = start_epoch + 1, 0, 0.0
+        restore_rng_state(ckpt.get("rng"))
         best_loss = ckpt.get("best_loss", float("inf"))
-        print(f"[resume] continuing from epoch {start_epoch} "
+        print(f"[resume] continuing from epoch {start_epoch} step {start_step} "
               f"(lr {[g['lr'] for g in optimizer.param_groups]})")
 
-    for epoch in range(start_epoch, cfg["train"]["epochs"]):
-        loss = train_one_epoch(model, loader, optimizer, criterion, device, cfg, epoch)
-        scheduler.step()
-        print(f"epoch {epoch} done avg_loss {loss:.4f}")
+    def save_ckpt(cur_epoch, cur_step, cur_running, best):
+        """Write last.pth atomically. ``cur_step`` -1 marks a finished epoch."""
         # Keep only a rolling last.pth (+ best.pth) so the output dir does not
         # fill up with one ~150MB file per epoch. Atomic write via tmp+rename.
         state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                  # [FIX #5] persist the LR schedule alongside the optimizer
                  "scheduler": scheduler.state_dict(),
-                 "epoch": epoch, "best_loss": min(best_loss, loss), "cfg": cfg}
+                 "epoch": cur_epoch, "best_loss": best, "cfg": cfg,
+                 # [FIX #16] mid-epoch position + RNG snapshot so an interrupted
+                 # run continues instead of replaying the seed stream.
+                 "step": cur_step, "running": cur_running,
+                 "rng": capture_rng_state()}
         tmp = os.path.join(out_dir, "last.pth.tmp")
         torch.save(state, tmp)
         os.replace(tmp, os.path.join(out_dir, "last.pth"))
+
+    for epoch in range(start_epoch, cfg["train"]["epochs"]):
+        # [FIX #16] Only the first epoch of a resumed run skips a prefix; the
+        # skip is in ITEMS, so scale the step count by the batch size.
+        skip_steps = start_step if epoch == start_epoch else 0
+        run_init = running_init if epoch == start_epoch else 0.0
+        sampler.set_epoch(epoch, skip_steps * batch_size)
+        if num_workers == 0:
+            seed_epoch_rng(base_seed, epoch)
+        loss = train_one_epoch(model, loader, optimizer, criterion, device, cfg,
+                               epoch, step_offset=skip_steps,
+                               running_init=run_init,
+                               total_steps=steps_per_epoch,
+                               save_cb=lambda e, s, r: save_ckpt(e, s, r, best_loss))
+        scheduler.step()
+        print(f"epoch {epoch} done avg_loss {loss:.4f}")
+        save_ckpt(epoch, -1, 0.0, min(best_loss, loss))
         if loss < best_loss:
             best_loss = loss
             shutil.copyfile(os.path.join(out_dir, "last.pth"),
@@ -338,15 +526,26 @@ def main():
             total_epochs = stage_cfg["train"]["epochs"]
             resume = None
             if os.path.isfile(last):
-                done_epoch = torch.load(last, map_location="cpu").get("epoch", -1)
-                if done_epoch >= total_epochs - 1:
+                _ck = torch.load(last, map_location="cpu")
+                done_epoch = _ck.get("epoch", -1)
+                # [FIX #16] A mid-epoch checkpoint (step >= 0) means the stage is
+                # NOT finished even when epoch == epochs-1, so it must not be
+                # skipped as complete the way an epoch-end checkpoint would be.
+                done_step = int(_ck.get("step", -1))
+                del _ck
+                if done_epoch >= total_epochs - 1 and done_step < 0:
                     print(f"=== curriculum stage {si}: {name} already complete "
                           f"(epoch {done_epoch}); skipping ===")
                     prev_ckpt = last
                     continue
                 resume = last
-                print(f"=== curriculum stage {si}: {name} resuming from epoch "
-                      f"{done_epoch + 1}/{total_epochs} ===")
+                if done_step >= 0:
+                    print(f"=== curriculum stage {si}: {name} resuming inside "
+                          f"epoch {done_epoch}/{total_epochs} at step "
+                          f"{done_step + 1} ===")
+                else:
+                    print(f"=== curriculum stage {si}: {name} resuming from epoch "
+                          f"{done_epoch + 1}/{total_epochs} ===")
             else:
                 print(f"=== curriculum stage {si}: {name} "
                       f"(mix_policy={stage_cfg['data'].get('mix_policy')}, "

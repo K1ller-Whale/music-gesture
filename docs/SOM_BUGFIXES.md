@@ -169,6 +169,100 @@ behavior later.
 
 ---
 
+## P1 (found later, during stage-0 training)
+
+### #15 `same_video` pairing required a different shot
+Stage 2's `same_video` pool required the partner clip to come from a *different*
+`shot_id`. Measured on the real preprocessed data, **694 of 809 videos (85.8%)
+are single-shot**, so that requirement left most videos with an empty pool and
+silently fell back to another policy — stage 2 would barely have trained on its
+intended distribution. The pool now only excludes the clip itself:
+
+```python
+pool = [j for j in self.by_video.get(vid, []) if j != idx]
+```
+
+Two clips from the same single-shot video are still a valid same-video pair (they
+are different time offsets of the same recording), which is what the stage is
+meant to exercise.
+
+### #16 RNG state was not checkpointed; no mid-epoch saving
+Two related problems in `train.py`, both observed live during stage 0:
+
+**(a) The random stream restarted on every resume.** `set_seed()` runs once per
+process, and the checkpoint stored only model/optimizer/scheduler/epoch. Because
+mix-and-separate *synthesises* its training data, the first epoch after a resume
+replayed the draws the run's very first epoch had consumed — different mixture
+pairings and different clip crops than an uninterrupted run would have used. The
+observed symptom: a resumed "epoch 11" reported `avg_loss 0.4113` while the
+interrupted attempt at the same epoch, from identical weights, tracked ~0.439.
+Epoch-to-epoch loss comparison was silently invalid across any interruption.
+
+**(b) Checkpoints were written only at epoch end,** so a kill mid-epoch discarded
+up to ~48 min of work at `batch_size: 2` on a 6 GB card.
+
+Fixes:
+
+- `capture_rng_state()` / `restore_rng_state()` snapshot and restore the python,
+  numpy, torch and CUDA RNGs. `torch.load(map_location=device)` moves the RNG
+  ByteTensors onto the GPU, so they are forced back to CPU before restoring.
+- `ResumableRandomSampler` replaces `DataLoader(shuffle=True)`. The permutation is
+  derived from `(seed, epoch)`, so **an epoch's data is now a pure function of the
+  config** rather than of how far the RNG stream had advanced. It also supports a
+  prefix skip, letting a mid-epoch resume drop already-consumed items *by index*
+  — fast-forwarding through the DataLoader instead would recompute trajectories
+  on the fly and cost nearly as much as training the steps.
+- `WorkerInit` keys each worker's python/numpy RNG to
+  `(seed, epoch, worker_id)`. The dataset draws its clip offset
+  (`random.uniform`) and mixing partner (`random.sample`) from python's global RNG
+  *inside the worker*, and PyTorch seeds workers off the global torch RNG, so
+  those draws were stream-position dependent too. `seed_epoch_rng()` covers the
+  `num_workers: 0` case, where no worker exists.
+- The checkpoint gains `step`, `running` and `rng`. `step: -1` marks a completed
+  epoch; `step >= 0` marks a mid-epoch save, and `running` carries the epoch's
+  partial loss sum so the printed running mean stays continuous across a resume.
+- The curriculum stage-completion test in `main()` now requires
+  `epoch >= epochs-1` **and** `step < 0`, so a mid-epoch checkpoint on the final
+  epoch is no longer mistaken for a finished stage.
+- New knob `train.save_every_steps` (500 in the paper-faithful config; 0 disables).
+
+**Backward compatible:** checkpoints without a `step` key are treated as
+epoch-complete, so existing `last.pth` / `best.pth` resume exactly as before —
+they just print a warning that their RNG state is unavailable.
+
+### #17 `worker_init_fn` must be picklable (Windows/macOS `spawn`)
+A regression introduced by #16, caught on the first run: the worker seeder was a
+closure returned by a factory function. On Linux the DataLoader forks and never
+serialises it, but **Windows and macOS use the `spawn` start method, which
+pickles `worker_init_fn` into each child process**, and a local function cannot
+be pickled by name:
+
+```
+AttributeError: Can't pickle local object 'make_worker_init_fn.<locals>._init'
+```
+
+(The accompanying `EOFError: Ran out of input` in a second traceback is a
+secondary artifact — the half-spawned child reading a stream the parent aborted
+mid-dump — not an independent bug.)
+
+The closure is now a module-level callable class, `WorkerInit`, holding only the
+base seed and a reference to the sampler (plain ints), so it pickles cleanly.
+Reading `self.sampler.epoch` inside `__call__` remains correct under `spawn`
+because the sampler is pickled when the iterator is created — that is, after
+`set_epoch()` has already run for that epoch.
+
+This is also a reminder that anything passed to a DataLoader on this platform
+must be a module-level, picklable object: no closures, no lambdas, no local
+classes.
+
+**Deliberate deviation, flagged:** per-epoch deterministic shuffling is not
+specified by the paper. It does not reduce randomness (every epoch still draws
+different pairings and crops); it only makes the draw reproducible. That is
+strictly better for a reproduction study, but it does mean this fork's epoch
+ordering will not match an upstream run seeded the same way.
+
+---
+
 ## Impact on the existing checkpoint
 
 **The 2-epoch stage-0 checkpoint is invalid and must be discarded.** #2, #3, and
